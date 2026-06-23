@@ -185,4 +185,219 @@ mod tests {
         assert_eq!(drained[0].body, "/compact");
         assert_eq!(drained[1].body, "run");
     }
+
+    #[test]
+    fn cron_task_new_sets_required_fields() {
+        let task = CronTask::new("moni", "repo", "*/5 * * * *", "run");
+        assert!(task.id.starts_with("cron-"));
+        assert_eq!(task.namespace, "moni");
+        assert_eq!(task.repo_url, "repo");
+        assert_eq!(task.schedule, "*/5 * * * *");
+        assert_eq!(task.message, "run");
+        assert_eq!(task.status, CronTaskStatus::Active);
+        assert_eq!(task.fire_count, 0);
+        assert!(task.last_run.is_none());
+        assert!(task.compact_every.is_none());
+    }
+
+    #[test]
+    fn paused_task_should_not_fire() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+        task.status = CronTaskStatus::Paused;
+
+        assert!(!task.should_fire_at(now).unwrap());
+    }
+
+    #[test]
+    fn task_should_not_fire_before_next_schedule() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 30).unwrap();
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+
+        assert!(!task.should_fire_at(now).unwrap());
+    }
+
+    #[test]
+    fn task_should_fire_at_next_minute() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+
+        assert!(task.should_fire_at(now).unwrap());
+    }
+
+    #[test]
+    fn last_run_is_used_for_next_schedule() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 30).unwrap();
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+        task.last_run = Some(Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap());
+
+        assert!(!task.should_fire_at(now).unwrap());
+    }
+
+    #[test]
+    fn invalid_schedule_returns_error() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "repo", "not cron", "run");
+        task.created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+
+        assert!(task.should_fire_at(now).is_err());
+    }
+
+    #[test]
+    fn five_field_cron_is_accepted() {
+        assert!(parse_schedule("* * * * *").is_ok());
+    }
+
+    #[test]
+    fn six_field_cron_is_accepted() {
+        assert!(parse_schedule("0 * * * * *").is_ok());
+    }
+
+    #[test]
+    fn compact_is_false_without_interval() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.fire_count = 10;
+        assert!(!task.needs_compact_before_next_fire());
+    }
+
+    #[test]
+    fn compact_is_false_for_zero_interval() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.fire_count = 10;
+        task.compact_every = Some(0);
+        assert!(!task.needs_compact_before_next_fire());
+    }
+
+    #[test]
+    fn compact_is_false_before_first_fire() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.fire_count = 0;
+        task.compact_every = Some(5);
+        assert!(!task.needs_compact_before_next_fire());
+    }
+
+    #[test]
+    fn compact_is_true_on_interval_boundary() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.fire_count = 10;
+        task.compact_every = Some(5);
+        assert!(task.needs_compact_before_next_fire());
+    }
+
+    #[test]
+    fn compact_is_false_off_interval_boundary() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.fire_count = 11;
+        task.compact_every = Some(5);
+        assert!(!task.needs_compact_before_next_fire());
+    }
+
+    #[tokio::test]
+    async fn tick_updates_fire_count_last_run_and_updated_at() {
+        let created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.created_at = created_at;
+
+        let queue = InMemoryNamespaceQueue::default();
+        let mut engine = CronEngine::new(vec![task]);
+
+        engine.tick(&queue, now).await.unwrap();
+
+        let task = &engine.tasks()[0];
+        assert_eq!(task.fire_count, 1);
+        assert_eq!(task.last_run, Some(now));
+        assert_eq!(task.updated_at, now);
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_enqueue_paused_task() {
+        let created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.created_at = created_at;
+        task.status = CronTaskStatus::Paused;
+
+        let queue = InMemoryNamespaceQueue::default();
+        let mut engine = CronEngine::new(vec![task]);
+
+        let fired = engine.tick(&queue, now).await.unwrap();
+
+        assert!(fired.is_empty());
+        assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_fire_same_task_twice_for_same_timestamp() {
+        let created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.created_at = created_at;
+
+        let queue = InMemoryNamespaceQueue::default();
+        let mut engine = CronEngine::new(vec![task]);
+
+        assert_eq!(engine.tick(&queue, now).await.unwrap().len(), 1);
+        assert!(engine.tick(&queue, now).await.unwrap().is_empty());
+        assert_eq!(queue.drain_namespace("moni").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tick_can_fire_multiple_tasks() {
+        let created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut a = CronTask::new("moni", "repo", "* * * * *", "a");
+        let mut b = CronTask::new("ops", "repo", "* * * * *", "b");
+        a.created_at = created_at;
+        b.created_at = created_at;
+
+        let queue = InMemoryNamespaceQueue::default();
+        let mut engine = CronEngine::new(vec![a, b]);
+
+        let fired = engine.tick(&queue, now).await.unwrap();
+
+        assert_eq!(fired.len(), 2);
+        assert_eq!(queue.drain_namespace("moni").await.unwrap()[0].body, "a");
+        assert_eq!(queue.drain_namespace("ops").await.unwrap()[0].body, "b");
+    }
+
+    #[tokio::test]
+    async fn tick_keeps_repo_url_on_prompt() {
+        let created_at = Utc.with_ymd_and_hms(2026, 6, 23, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "https://example.com/repo", "* * * * *", "run");
+        task.created_at = created_at;
+
+        let queue = InMemoryNamespaceQueue::default();
+        let mut engine = CronEngine::new(vec![task]);
+
+        engine.tick(&queue, now).await.unwrap();
+
+        let prompt = queue.drain_namespace("moni").await.unwrap().remove(0);
+        assert_eq!(prompt.repo_url.as_deref(), Some("https://example.com/repo"));
+    }
+
+    #[test]
+    fn cron_task_status_serializes_as_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&CronTaskStatus::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CronTaskStatus::Paused).unwrap(),
+            "\"paused\""
+        );
+    }
+
+    #[test]
+    fn cron_task_round_trips_json() {
+        let task = CronTask::new("moni", "repo", "* * * * *", "run");
+        let encoded = serde_json::to_string(&task).unwrap();
+        let decoded: CronTask = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, task);
+    }
 }

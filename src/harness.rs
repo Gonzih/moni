@@ -258,11 +258,26 @@ done
         fs::set_permissions(path, permissions).unwrap();
     }
 
+    fn write_script(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
     async fn next_event(rx: &mut AgentEventStream) -> AgentEvent {
         timeout(Duration::from_secs(2), rx.recv())
             .await
             .unwrap()
             .unwrap()
+    }
+
+    async fn collect_lines(rx: &mut AgentEventStream, count: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for _ in 0..count {
+            lines.push(next_event(rx).await.line);
+        }
+        lines
     }
 
     #[tokio::test]
@@ -289,5 +304,288 @@ done
         assert!(harness.status().running);
         harness.stop(StopReason::Reset).await.unwrap();
         assert!(!harness.status().running);
+    }
+
+    #[test]
+    fn new_harness_reports_initial_status() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig::new(AgentEngine::Codex, "/bin/cat");
+        let (harness, _events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        let status = harness.status();
+        assert_eq!(status.namespace, "moni");
+        assert_eq!(status.engine, AgentEngine::Codex);
+        assert!(!status.running);
+        assert!(status.pid.is_none());
+    }
+
+    #[test]
+    fn harness_exposes_engine_and_namespace() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig::new(AgentEngine::Claude, "/bin/cat");
+        let (harness, _events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        assert_eq!(harness.engine(), AgentEngine::Claude);
+        assert_eq!(harness.namespace(), "moni");
+    }
+
+    #[tokio::test]
+    async fn send_before_start_returns_not_running() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig::new(AgentEngine::Claude, "/bin/cat");
+        let (mut harness, _events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        let err = harness.send("hello").await.unwrap_err();
+
+        assert!(err.to_string().contains("not running"));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_already_running_process() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let config = EngineConfig::new(AgentEngine::Claude, bin);
+        let (mut harness, _events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        let err = harness.start().await.unwrap_err();
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert!(err.to_string().contains("already running"));
+    }
+
+    #[tokio::test]
+    async fn stop_before_start_is_noop_with_status_event() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig::new(AgentEngine::Claude, "/bin/cat");
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        let event = next_event(&mut events).await;
+        assert_eq!(event.stream, EventStreamKind::Status);
+        assert_eq!(event.line, "stopped:Shutdown");
+    }
+
+    #[tokio::test]
+    async fn process_harness_handles_multiple_prompts() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let config = EngineConfig::new(AgentEngine::Claude, bin);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        harness.send("one").await.unwrap();
+        harness.send("two").await.unwrap();
+
+        let lines = collect_lines(&mut events, 4).await;
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert!(lines.iter().any(|line| line == "ok:one"));
+        assert!(lines.iter().any(|line| line == "ok:two"));
+    }
+
+    #[tokio::test]
+    async fn process_harness_streams_stderr_lines() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("stderr-agent");
+        write_script(
+            &bin,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  echo "stderr:$line" >&2
+done
+"#,
+        );
+        let config = EngineConfig::new(AgentEngine::Claude, bin);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        harness.send("boom").await.unwrap();
+
+        let mut seen_stderr = false;
+        for _ in 0..3 {
+            let event = next_event(&mut events).await;
+            if event.stream == EventStreamKind::Stderr && event.line == "stderr:boom" {
+                seen_stderr = true;
+                break;
+            }
+        }
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert!(seen_stderr);
+    }
+
+    #[tokio::test]
+    async fn process_harness_passes_configured_args() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("args-agent");
+        write_script(
+            &bin,
+            r#"#!/usr/bin/env bash
+echo "args:$*"
+while IFS= read -r line; do
+  echo "ok:$line"
+done
+"#,
+        );
+        let config = EngineConfig::new(AgentEngine::Claude, bin).with_args(["--alpha", "beta"]);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+
+        let lines = collect_lines(&mut events, 2).await;
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert!(lines.iter().any(|line| line == "args:--alpha beta"));
+    }
+
+    #[tokio::test]
+    async fn process_harness_runs_in_workspace_path() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("pwd-agent");
+        write_script(
+            &bin,
+            r#"#!/usr/bin/env bash
+pwd
+while IFS= read -r line; do
+  echo "$line"
+done
+"#,
+        );
+        let config = EngineConfig::new(AgentEngine::Claude, bin);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+
+        let lines = collect_lines(&mut events, 2).await;
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        let expected = fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            lines
+                .iter()
+                .filter_map(|line| fs::canonicalize(line).ok())
+                .any(|line| line == expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_emits_stop_reason() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let config = EngineConfig::new(AgentEngine::Claude, bin);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        let _ = next_event(&mut events).await;
+        harness.stop(StopReason::Clear).await.unwrap();
+
+        let mut saw_reason = false;
+        for _ in 0..3 {
+            let event = next_event(&mut events).await;
+            if event.line == "stopped:Clear" {
+                saw_reason = true;
+                break;
+            }
+        }
+        assert!(saw_reason);
+    }
+
+    #[tokio::test]
+    async fn events_include_codex_engine_metadata() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let config = EngineConfig::new(AgentEngine::Codex, bin);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+
+        let event = next_event(&mut events).await;
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert_eq!(event.engine, AgentEngine::Codex);
+        assert_eq!(event.namespace, "moni");
+    }
+
+    #[tokio::test]
+    async fn start_missing_binary_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let config = EngineConfig::new(AgentEngine::Claude, dir.path().join("missing"));
+        let (mut harness, _events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        let err = harness.start().await.unwrap_err();
+
+        assert!(err.to_string().contains("No such file") || err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn status_has_pid_after_start() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let config = EngineConfig::new(AgentEngine::Claude, bin);
+        let (mut harness, _events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        let status = harness.status();
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert!(status.running);
+        assert!(status.pid.is_some());
+    }
+
+    #[test]
+    fn stop_reason_serializes_as_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&StopReason::Reset).unwrap(),
+            "\"reset\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::Clear).unwrap(),
+            "\"clear\""
+        );
+    }
+
+    #[test]
+    fn event_stream_kind_serializes_as_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&EventStreamKind::Stdout).unwrap(),
+            "\"stdout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventStreamKind::Stderr).unwrap(),
+            "\"stderr\""
+        );
+    }
+
+    #[test]
+    fn agent_event_round_trips_json() {
+        let event = AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Claude,
+            stream: EventStreamKind::Stdout,
+            line: "hello".to_string(),
+        };
+        let encoded = serde_json::to_string(&event).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn harness_status_round_trips_json() {
+        let status = AgentHarnessStatus {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            running: true,
+            pid: Some(42),
+        };
+        let encoded = serde_json::to_string(&status).unwrap();
+        let decoded: AgentHarnessStatus = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, status);
     }
 }
