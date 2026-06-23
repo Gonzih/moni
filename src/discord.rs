@@ -128,10 +128,17 @@ impl EventHandler for MoniDiscordHandler {
                 .await
             {
                 tracing::error!(channel_id = %message.channel_id, error = %err, "failed to handle unbound discord message");
+            } else {
+                tracing::info!(channel_id = %message.channel_id, "ignored unbound Discord message");
             }
             return;
         };
 
+        tracing::info!(
+            channel_id = %binding.channel_id,
+            namespace = %binding.namespace,
+            "routing Discord message"
+        );
         if let Err(err) = self.app.handle_discord_message(&binding, inbound).await {
             tracing::error!(channel_id = %binding.channel_id, namespace = %binding.namespace, error = %err, "failed to route discord message");
         }

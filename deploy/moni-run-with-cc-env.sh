@@ -14,14 +14,13 @@ if [ -n "$OLD_PATH" ]; then
 fi
 
 export MONI_DISCORD_TOKEN="$(plist_value DISCORD_BOT_TOKEN)"
-CHANNEL_ID="$(plist_value DISCORD_NOTIFY_CHANNEL_ID)"
 ALLOWED_USER_IDS="$(plist_value DISCORD_ALLOWED_USER_IDS)"
 CODEX_BIN="$(plist_value CODEX_BIN)"
 
 export MONI_NATS_URL="nats://127.0.0.1:4222"
-export MONI_CHANNELS="${CHANNEL_ID}=money-brain=https://github.com/Gonzih/money-brain.git"
+export MONI_CHANNELS="1514478248057110618=cron=https://github.com/Gonzih/cron.git,1514524404745240609=cc-wire=https://github.com/Gonzih/cc-wire.git,1514658379384229938=money-brain=https://github.com/Gonzih/money-brain.git,1514659822794969309=simorgh-mobile-app=https://github.com/Gonzih/simorgh-mobile-app.git,1514676507124170885=of-stack=https://github.com/Gonzih/of-stack.git,1514676615668305971=simorgh-web-app=https://github.com/Gonzih/simorgh-web-app.git,1514743825736798369=metaweb-future-path=https://github.com/Gonzih/metaweb-future-path.git,1514785858887352400=nexus-souls=https://github.com/Gonzih/nexus-souls.git,1517279248023290017=recruitment=https://github.com/Gonzih/recruitment.git,1517331011187511398=nexus-research=https://github.com/Gonzih/nexus-research.git,1517695980949078048=cc-suite-tests=https://github.com/Gonzih/cc-suite-tests.git,1517709847053734051=cc-suite=https://github.com/Gonzih/cc-suite.git,1518796075572396123=harmony=https://github.com/Gonzih/harmony.git"
 export MONI_STATE_PATH="$HOME/.local/share/moni/state.json"
-export MONI_WORKSPACE_ROOT="$HOME"
+export MONI_WORKSPACE_ROOT="$HOME/cc-discord-workspace"
 export MONI_ENGINE="codex"
 export MONI_AGENT_BIN="${CODEX_BIN:-/opt/homebrew/bin/codex}"
 export MONI_CODEX_APP_SERVER="1"
