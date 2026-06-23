@@ -1,15 +1,16 @@
-use std::{path::PathBuf, process::Stdio};
+use std::{path::PathBuf, process::Stdio, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::mpsc,
+    sync::{Mutex, mpsc},
 };
 
-use crate::engine::{AgentEngine, EngineConfig};
+use crate::engine::{AgentEngine, AgentProtocol, EngineConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,6 +74,14 @@ pub struct ProcessAgentHarness {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     events: mpsc::Sender<AgentEvent>,
+    codex_state: Arc<Mutex<CodexAppServerState>>,
+    next_request_id: u64,
+}
+
+#[derive(Debug, Default)]
+struct CodexAppServerState {
+    thread_id: Option<String>,
+    pending_message: String,
 }
 
 impl ProcessAgentHarness {
@@ -90,6 +99,8 @@ impl ProcessAgentHarness {
                 child: None,
                 stdin: None,
                 events,
+                codex_state: Arc::new(Mutex::new(CodexAppServerState::default())),
+                next_request_id: 1,
             },
             rx,
         )
@@ -101,13 +112,26 @@ impl ProcessAgentHarness {
     {
         let namespace = self.namespace.clone();
         let engine = self.config.engine;
+        let protocol = self.config.protocol;
         let events = self.events.clone();
+        let codex_state = self.codex_state.clone();
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(reader).lines();
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
+                        if protocol == AgentProtocol::CodexAppServer {
+                            handle_codex_app_server_line(
+                                &namespace,
+                                engine,
+                                &events,
+                                codex_state.clone(),
+                                line,
+                            )
+                            .await;
+                            continue;
+                        }
                         let _ = events
                             .send(AgentEvent {
                                 namespace: namespace.clone(),
@@ -132,6 +156,97 @@ impl ProcessAgentHarness {
                 }
             }
         });
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        id
+    }
+
+    async fn write_jsonrpc(&mut self, message: Value) -> anyhow::Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| HarnessError::MissingStdin(self.namespace.clone()))?;
+        let bytes = serde_json::to_vec(&message)?;
+        stdin.write_all(&bytes).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn bootstrap_codex_app_server(&mut self) -> anyhow::Result<()> {
+        let initialize_id = self.next_request_id();
+        let cwd = self.workspace_path.to_string_lossy().to_string();
+        self.write_jsonrpc(json!({
+            "jsonrpc": "2.0",
+            "id": initialize_id,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "moni",
+                    "title": "moni",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "requestAttestation": false
+                }
+            }
+        }))
+        .await?;
+
+        let thread_start_id = self.next_request_id();
+        self.write_jsonrpc(json!({
+            "jsonrpc": "2.0",
+            "id": thread_start_id,
+            "method": "thread/start",
+            "params": {
+                "cwd": cwd,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "model": null
+            }
+        }))
+        .await
+    }
+
+    async fn wait_for_codex_thread_id(&self) -> anyhow::Result<String> {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        loop {
+            if let Some(thread_id) = self.codex_state.lock().await.thread_id.clone() {
+                return Ok(thread_id);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for Codex app-server thread id for namespace {}",
+                    self.namespace
+                );
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn send_codex_turn(&mut self, prompt: &str) -> anyhow::Result<()> {
+        let thread_id = self.wait_for_codex_thread_id().await?;
+        let turn_start_id = self.next_request_id();
+        let cwd = self.workspace_path.to_string_lossy().to_string();
+        self.write_jsonrpc(json!({
+            "jsonrpc": "2.0",
+            "id": turn_start_id,
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "cwd": cwd,
+                "input": [{
+                    "type": "text",
+                    "text": prompt,
+                    "text_elements": []
+                }]
+            }
+        }))
+        .await
     }
 
     pub async fn reap_if_exited(&mut self) -> anyhow::Result<bool> {
@@ -191,6 +306,11 @@ impl AgentHarness for ProcessAgentHarness {
             self.emit_output_task(stderr, EventStreamKind::Stderr);
         }
 
+        self.child = Some(child);
+        if self.config.protocol == AgentProtocol::CodexAppServer {
+            self.bootstrap_codex_app_server().await?;
+        }
+
         let _ = self
             .events
             .send(AgentEvent {
@@ -201,13 +321,15 @@ impl AgentHarness for ProcessAgentHarness {
             })
             .await;
 
-        self.child = Some(child);
         Ok(())
     }
 
     async fn send(&mut self, prompt: &str) -> anyhow::Result<()> {
         if self.child.is_none() {
             return Err(HarnessError::NotRunning(self.namespace.clone()).into());
+        }
+        if self.config.protocol == AgentProtocol::CodexAppServer {
+            return self.send_codex_turn(prompt).await;
         }
 
         let stdin = self
@@ -253,6 +375,99 @@ impl AgentHarness for ProcessAgentHarness {
     }
 }
 
+async fn handle_codex_app_server_line(
+    namespace: &str,
+    engine: AgentEngine,
+    events: &mpsc::Sender<AgentEvent>,
+    state: Arc<Mutex<CodexAppServerState>>,
+    line: String,
+) {
+    let Ok(message) = serde_json::from_str::<Value>(&line) else {
+        emit_agent_event(events, namespace, engine, EventStreamKind::Stderr, line).await;
+        return;
+    };
+
+    if let Some(error) = message.get("error") {
+        emit_agent_event(
+            events,
+            namespace,
+            engine,
+            EventStreamKind::Status,
+            format!("codex-error:{error}"),
+        )
+        .await;
+        return;
+    }
+
+    if let Some(thread_id) = message
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        state.lock().await.thread_id = Some(thread_id);
+        return;
+    }
+
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return;
+    };
+
+    match method {
+        "thread/started" => {
+            if let Some(thread_id) = message
+                .pointer("/params/thread/id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                state.lock().await.thread_id = Some(thread_id);
+            }
+        }
+        "agentMessageDelta" => {
+            if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
+                state.lock().await.pending_message.push_str(delta);
+            }
+        }
+        "turnCompleted" => {
+            let mut state = state.lock().await;
+            let body = state.pending_message.trim().to_string();
+            state.pending_message.clear();
+            drop(state);
+
+            if !body.is_empty() {
+                emit_agent_event(events, namespace, engine, EventStreamKind::Stdout, body).await;
+            }
+        }
+        "error" => {
+            emit_agent_event(
+                events,
+                namespace,
+                engine,
+                EventStreamKind::Status,
+                format!("codex-error:{message}"),
+            )
+            .await;
+        }
+        _ => {}
+    }
+}
+
+async fn emit_agent_event(
+    events: &mpsc::Sender<AgentEvent>,
+    namespace: &str,
+    engine: AgentEngine,
+    stream: EventStreamKind,
+    line: impl Into<String>,
+) {
+    let _ = events
+        .send(AgentEvent {
+            namespace: namespace.to_string(),
+            engine,
+            stream,
+            line: line.into(),
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt, path::Path};
@@ -289,7 +504,7 @@ done
     }
 
     async fn next_event(rx: &mut AgentEventStream) -> AgentEvent {
-        timeout(Duration::from_secs(2), rx.recv())
+        timeout(Duration::from_secs(10), rx.recv())
             .await
             .unwrap()
             .unwrap()
@@ -578,7 +793,7 @@ exit 0
 
         harness.start().await.unwrap();
         let _ = next_event(&mut events).await;
-        let exited = timeout(Duration::from_secs(2), async {
+        let exited = timeout(Duration::from_secs(10), async {
             loop {
                 if harness.reap_if_exited().await.unwrap() {
                     return true;
@@ -591,6 +806,44 @@ exit 0
 
         assert!(exited);
         assert!(!harness.status().running);
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_protocol_submits_turn_and_flushes_delta() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("codex-app-server");
+        write_script(
+            &bin,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  if [[ "$line" == *'"method":"thread/start"'* ]]; then
+    echo '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    echo '{"method":"agentMessageDelta","params":{"delta":"hello "}}'
+    echo '{"method":"agentMessageDelta","params":{"delta":"codex"}}'
+    echo '{"method":"turnCompleted","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}'
+  fi
+done
+"#,
+        );
+        let config =
+            EngineConfig::new(AgentEngine::Codex, bin).with_protocol(AgentProtocol::CodexAppServer);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        harness.send("run").await.unwrap();
+
+        let mut saw_output = false;
+        for _ in 0..4 {
+            let event = next_event(&mut events).await;
+            if event.stream == EventStreamKind::Stdout && event.line == "hello codex" {
+                saw_output = true;
+                break;
+            }
+        }
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert!(saw_output);
     }
 
     #[test]

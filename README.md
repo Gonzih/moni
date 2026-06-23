@@ -16,6 +16,11 @@ Rust successor to `cc-discord`.
 - NATS wildcard consumer that drives persistent per-namespace agent sessions.
 - Agent stdout routed back to Discord through the namespace/channel registry.
 - Cron scheduled task model that enqueues normal namespace messages.
+- Runtime cron ticker for persisted schedules.
+- Atomic JSON state writes.
+- Discord output chunking and send retries.
+- Optional Discord user allowlist.
+- Optional Codex app-server JSON-RPC session protocol via stdio.
 - Mockable process boundary for tests.
 
 ## Product Direction
@@ -37,10 +42,29 @@ export MONI_CHANNELS="123456789=moni=https://github.com/example/moni"
 export MONI_STATE_PATH="$HOME/.config/moni/state.json"
 export MONI_ENGINE="codex"
 export MONI_AGENT_BIN="codex"
+export MONI_CODEX_APP_SERVER="1"
+export MONI_ALLOWED_USER_IDS="111111111111111111,222222222222222222"
+export MONI_CRON_TICK_SECONDS="30"
+export RUST_LOG="moni=info,warn"
 cargo run
 ```
 
 `MONI_CHANNELS` is comma-separated. Each entry is `discord_channel_id=namespace=repo_url`.
+
+Runtime environment:
+
+- `MONI_DISCORD_TOKEN`: Discord bot token.
+- `MONI_CHANNELS`: initial static bindings. Persisted bindings from `MONI_STATE_PATH` are merged on startup.
+- `MONI_NATS_URL`: NATS URL, default `nats://127.0.0.1:4222`.
+- `MONI_STATE_PATH`: JSON state path for dynamic channel bindings and cron tasks.
+- `MONI_WORKSPACE_ROOT`: parent directory for per-namespace workspaces, default `$HOME/moni-workspace`.
+- `MONI_ENGINE`: `codex` or `claude`, default `codex`.
+- `MONI_AGENT_BIN`: agent executable, default matches `MONI_ENGINE`.
+- `MONI_AGENT_ARGS`: whitespace-separated agent arguments. For line-mode Codex, the current unsafe automation flag is `--dangerously-bypass-approvals-and-sandbox`.
+- `MONI_CODEX_APP_SERVER`: when `1`, `true`, or `yes`, runs Codex through `codex app-server --stdio`, starts a JSON-RPC thread, submits Discord/NATS prompts with `turn/start`, and flushes aggregated assistant deltas on `turnCompleted`.
+- `MONI_ALLOWED_USER_IDS`: optional comma-separated Discord user IDs. Empty means any non-bot user in a reachable channel can interact with the runner.
+- `MONI_CRON_TICK_SECONDS`: cron polling interval, default `30`.
+- `RUST_LOG`: tracing filter, default `moni=info,warn`.
 
 ## Current Confidence
 
@@ -55,4 +79,12 @@ docker run -d --rm -p 4224:4222 nats:2-alpine
 MONI_TEST_NATS_URL=nats://127.0.0.1:4224 cargo test live_nats_publish_reaches_session_manager_when_configured -- --nocapture
 ```
 
-The remaining confidence gap is live Discord validation with a real bot token/guild/channel. Unit and integration-style tests cover the runtime seams with mock agents, memory queues, dynamic registration, state persistence, cron, process lifecycle, and live NATS publish/consume behavior.
+The remaining confidence gap is live Discord validation with a real bot token/guild/channel. Unit and integration-style tests cover the runtime seams with mock agents, memory queues, dynamic registration, state persistence, cron, process lifecycle, Discord output formatting, authorization config, Codex app-server JSON-RPC session flow, and live NATS publish/consume behavior.
+
+## Known Replacement Gaps
+
+- NATS usage is core pub/sub, not JetStream durable delivery.
+- Discord uses raw text commands, not slash commands or interaction permissions.
+- Codex app-server support handles initialize, thread start, turn start, assistant deltas, and turn completion; approval/input request routing is not implemented yet.
+- Output delivery is chunked and retried, but there is no explicit global Discord edit/send scheduler.
+- No packaged launchd/systemd/Docker deployment artifacts are included yet.

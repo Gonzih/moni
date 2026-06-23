@@ -26,11 +26,18 @@ impl AgentEngine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentProtocol {
+    Line,
+    CodexAppServer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     pub engine: AgentEngine,
     pub command: PathBuf,
     pub args: Vec<String>,
+    pub protocol: AgentProtocol,
 }
 
 impl EngineConfig {
@@ -39,11 +46,17 @@ impl EngineConfig {
             engine,
             command: command.into(),
             args: Vec::new(),
+            protocol: AgentProtocol::Line,
         }
     }
 
     pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_protocol(mut self, protocol: AgentProtocol) -> Self {
+        self.protocol = protocol;
         self
     }
 }
@@ -110,6 +123,7 @@ mod tests {
         assert_eq!(config.engine, AgentEngine::Claude);
         assert_eq!(config.command, PathBuf::from("/bin/echo"));
         assert!(config.args.is_empty());
+        assert_eq!(config.protocol, AgentProtocol::Line);
     }
 
     #[test]
@@ -117,5 +131,13 @@ mod tests {
         let config = EngineConfig::new(AgentEngine::Codex, "/bin/echo")
             .with_args(["--one", "two", "--three"]);
         assert_eq!(config.args, vec!["--one", "two", "--three"]);
+    }
+
+    #[test]
+    fn engine_config_can_select_codex_app_server_protocol() {
+        let config = EngineConfig::new(AgentEngine::Codex, "codex")
+            .with_protocol(AgentProtocol::CodexAppServer);
+
+        assert_eq!(config.protocol, AgentProtocol::CodexAppServer);
     }
 }

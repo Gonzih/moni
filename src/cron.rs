@@ -68,7 +68,7 @@ impl CronTask {
 
     pub fn needs_compact_before_next_fire(&self) -> bool {
         match self.compact_every {
-            Some(n) if n > 0 => self.fire_count > 0 && self.fire_count % n == 0,
+            Some(n) if n > 0 => self.fire_count > 0 && self.fire_count.is_multiple_of(n),
             _ => false,
         }
     }

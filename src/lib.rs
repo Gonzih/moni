@@ -11,14 +11,14 @@ pub mod registry;
 pub mod session;
 pub mod store;
 
-pub use app::{MoniApp, MoniAppConfig};
+pub use app::{MoniApp, MoniAppConfig, run_cron_loop};
 pub use commands::{CommandAction, ParsedCommand, parse_command};
 pub use cron::{CronEngine, CronTask, CronTaskStatus};
 pub use discord::{
     ChannelBinding, DiscordBotConfig, DiscordInboundMessage, MoniDiscordHandler,
     parse_channel_bindings, route_discord_message, run_discord_bot,
 };
-pub use engine::{AgentEngine, EngineConfig};
+pub use engine::{AgentEngine, AgentProtocol, EngineConfig};
 pub use harness::{
     AgentEvent, AgentEventStream, AgentHarness, AgentHarnessStatus, EventStreamKind,
     ProcessAgentHarness, StopReason,

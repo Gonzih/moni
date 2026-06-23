@@ -42,9 +42,19 @@ impl StateStore for FileStateStore {
         if let Some(parent) = self.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&self.path, serde_json::to_vec_pretty(state)?).await?;
+        let temp_path = temp_state_path(&self.path);
+        tokio::fs::write(&temp_path, serde_json::to_vec_pretty(state)?).await?;
+        tokio::fs::rename(&temp_path, &self.path).await?;
         Ok(())
     }
+}
+
+fn temp_state_path(path: &std::path::Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "state.json".into());
+    path.with_file_name(format!("{}.{}.tmp", file_name, std::process::id()))
 }
 
 #[cfg(test)]
@@ -87,5 +97,17 @@ mod tests {
         let store = FileStateStore::new(&path);
         store.save(&MoniState::default()).await.unwrap();
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn save_does_not_leave_temp_file_after_success() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = FileStateStore::new(&path);
+        store.save(&MoniState::default()).await.unwrap();
+
+        let temp_path = temp_state_path(&path);
+        assert!(path.exists());
+        assert!(!temp_path.exists());
     }
 }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
@@ -95,7 +95,14 @@ impl MoniApp {
 
     pub async fn tick_cron(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<String>> {
         let mut cron = self.cron.lock().await;
-        cron.tick(self.queue.as_ref(), now).await
+        let fired = cron.tick(self.queue.as_ref(), now).await?;
+        drop(cron);
+
+        if !fired.is_empty() {
+            self.persist_state().await?;
+        }
+
+        Ok(fired)
     }
 
     pub async fn cron_count(&self) -> usize {
@@ -227,6 +234,19 @@ impl MoniApp {
                 cron_tasks: cron.tasks().to_vec(),
             })
             .await
+    }
+}
+
+pub async fn run_cron_loop(app: Arc<MoniApp>, tick_every: Duration) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(tick_every);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+        let fired = app.tick_cron(Utc::now()).await?;
+        if !fired.is_empty() {
+            tracing::info!(count = fired.len(), tasks = ?fired, "cron tasks fired");
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serenity::{
@@ -47,6 +47,7 @@ pub async fn route_discord_message<Q: NamespaceQueue + ?Sized>(
 pub struct DiscordBotConfig {
     pub token: String,
     pub bindings: Vec<ChannelBinding>,
+    pub allowed_user_ids: Vec<String>,
 }
 
 impl DiscordBotConfig {
@@ -57,18 +58,40 @@ impl DiscordBotConfig {
         Ok(Self {
             token: token.into(),
             bindings,
+            allowed_user_ids: Vec::new(),
         })
+    }
+
+    pub fn with_allowed_user_ids(mut self, allowed_user_ids: Vec<String>) -> anyhow::Result<Self> {
+        for user_id in &allowed_user_ids {
+            user_id.parse::<u64>()?;
+        }
+        self.allowed_user_ids = allowed_user_ids;
+        Ok(self)
     }
 }
 
 pub struct MoniDiscordHandler {
     app: Arc<MoniApp>,
     registry: BindingRegistry,
+    allowed_user_ids: HashSet<String>,
 }
 
 impl MoniDiscordHandler {
-    pub fn new(app: Arc<MoniApp>, registry: BindingRegistry) -> Self {
-        Self { app, registry }
+    pub fn new(
+        app: Arc<MoniApp>,
+        registry: BindingRegistry,
+        allowed_user_ids: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            app,
+            registry,
+            allowed_user_ids: allowed_user_ids.into_iter().collect(),
+        }
+    }
+
+    fn is_authorized(&self, author_id: &str) -> bool {
+        self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(author_id)
     }
 }
 
@@ -82,10 +105,19 @@ impl EventHandler for MoniDiscordHandler {
         if message.author.bot {
             return;
         }
+        let author_id = message.author.id.to_string();
+        if !self.is_authorized(&author_id) {
+            tracing::warn!(
+                author_id = %author_id,
+                channel_id = %message.channel_id,
+                "ignored Discord message from unauthorized user"
+            );
+            return;
+        }
 
         let inbound = DiscordInboundMessage {
             channel_id: message.channel_id.to_string(),
-            author_id: message.author.id.to_string(),
+            author_id,
             body: message.content,
         };
 
@@ -114,7 +146,7 @@ pub async fn run_discord_bot(
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
-    let handler = MoniDiscordHandler::new(app, registry);
+    let handler = MoniDiscordHandler::new(app, registry, config.allowed_user_ids);
     let mut client = Client::builder(config.token, intents)
         .event_handler(handler)
         .await?;
@@ -304,6 +336,75 @@ mod tests {
 
         assert_eq!(config.token, "token");
         assert_eq!(config.bindings[0].namespace, "moni");
+    }
+
+    #[test]
+    fn bot_config_keeps_validated_allowed_users() {
+        let config = DiscordBotConfig::new("token", Vec::new())
+            .unwrap()
+            .with_allowed_user_ids(vec!["42".to_string()])
+            .unwrap();
+
+        assert_eq!(config.allowed_user_ids, vec!["42".to_string()]);
+    }
+
+    #[test]
+    fn bot_config_rejects_invalid_allowed_user_id() {
+        let err = DiscordBotConfig::new("token", Vec::new())
+            .unwrap()
+            .with_allowed_user_ids(vec!["not-a-number".to_string()])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid digit"));
+    }
+
+    #[test]
+    fn empty_allowed_user_list_authorizes_everyone() {
+        let handler = MoniDiscordHandler {
+            app: Arc::new(MoniApp::new(crate::app::MoniAppConfig {
+                queue: Arc::new(InMemoryNamespaceQueue::default()),
+                sessions: Arc::new(crate::SessionManager::new(
+                    "/tmp/moni-test",
+                    Arc::new(crate::StaticEngineConfigResolver::new(
+                        crate::EngineConfig::new(crate::AgentEngine::Codex, "/bin/cat"),
+                    )),
+                    Arc::new(crate::InMemoryOutputSink::default()),
+                )),
+                output: Arc::new(crate::InMemoryOutputSink::default()),
+                cron: crate::CronEngine::new(Vec::new()),
+                registry: BindingRegistry::new(Vec::new()).unwrap(),
+                state_store: None,
+            })),
+            registry: BindingRegistry::new(Vec::new()).unwrap(),
+            allowed_user_ids: HashSet::new(),
+        };
+
+        assert!(handler.is_authorized("42"));
+    }
+
+    #[test]
+    fn configured_allowed_user_list_blocks_unknown_users() {
+        let handler = MoniDiscordHandler {
+            app: Arc::new(MoniApp::new(crate::app::MoniAppConfig {
+                queue: Arc::new(InMemoryNamespaceQueue::default()),
+                sessions: Arc::new(crate::SessionManager::new(
+                    "/tmp/moni-test",
+                    Arc::new(crate::StaticEngineConfigResolver::new(
+                        crate::EngineConfig::new(crate::AgentEngine::Codex, "/bin/cat"),
+                    )),
+                    Arc::new(crate::InMemoryOutputSink::default()),
+                )),
+                output: Arc::new(crate::InMemoryOutputSink::default()),
+                cron: crate::CronEngine::new(Vec::new()),
+                registry: BindingRegistry::new(Vec::new()).unwrap(),
+                state_store: None,
+            })),
+            registry: BindingRegistry::new(Vec::new()).unwrap(),
+            allowed_user_ids: HashSet::from(["42".to_string()]),
+        };
+
+        assert!(handler.is_authorized("42"));
+        assert!(!handler.is_authorized("7"));
     }
 
     #[test]
