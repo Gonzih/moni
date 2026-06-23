@@ -16,6 +16,14 @@ impl AgentEngine {
             Self::Codex => "codex",
         }
     }
+
+    pub fn from_name(name: &str) -> anyhow::Result<Self> {
+        match name {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            other => anyhow::bail!("unknown agent engine `{other}`"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +60,24 @@ mod tests {
     #[test]
     fn codex_engine_string_is_stable() {
         assert_eq!(AgentEngine::Codex.as_str(), "codex");
+    }
+
+    #[test]
+    fn parses_claude_engine_name() {
+        assert_eq!(
+            AgentEngine::from_name("claude").unwrap(),
+            AgentEngine::Claude
+        );
+    }
+
+    #[test]
+    fn parses_codex_engine_name() {
+        assert_eq!(AgentEngine::from_name("codex").unwrap(), AgentEngine::Codex);
+    }
+
+    #[test]
+    fn rejects_unknown_engine_name() {
+        assert!(AgentEngine::from_name("nope").is_err());
     }
 
     #[test]

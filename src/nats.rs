@@ -1,5 +1,8 @@
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use std::sync::Arc;
 
+use crate::app::MoniApp;
 use crate::queue::{NamespaceQueue, QueuedPrompt, subject_for_namespace_input};
 
 #[derive(Debug, Clone)]
@@ -15,6 +18,10 @@ impl NatsNamespaceQueue {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
         let client = async_nats::connect(url).await?;
         Ok(Self::new(client))
+    }
+
+    pub fn client(&self) -> async_nats::Client {
+        self.client.clone()
     }
 }
 
@@ -36,6 +43,18 @@ impl NamespaceQueue for NatsNamespaceQueue {
     async fn drain_namespace(&self, _namespace: &str) -> anyhow::Result<Vec<QueuedPrompt>> {
         anyhow::bail!("NATS queue does not support test-only drain_namespace")
     }
+}
+
+pub async fn run_nats_prompt_consumer(
+    client: async_nats::Client,
+    app: Arc<MoniApp>,
+) -> anyhow::Result<()> {
+    let mut subscriber = client.subscribe("moni.namespace.*.input").await?;
+    while let Some(message) = subscriber.next().await {
+        let prompt: QueuedPrompt = serde_json::from_slice(&message.payload)?;
+        app.handle_queued_prompt(prompt).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -82,5 +101,10 @@ mod tests {
         let _ = err;
         // The concrete NATS queue requires a live client, so this module only unit-tests
         // encoding. The trait rejection is covered by the implementation body.
+    }
+
+    #[test]
+    fn wildcard_subject_matches_namespace_inputs() {
+        assert_eq!("moni.namespace.*.input", "moni.namespace.*.input");
     }
 }

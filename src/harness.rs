@@ -133,6 +133,29 @@ impl ProcessAgentHarness {
             }
         });
     }
+
+    pub async fn reap_if_exited(&mut self) -> anyhow::Result<bool> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(false);
+        };
+
+        if let Some(status) = child.try_wait()? {
+            self.child.take();
+            self.stdin.take();
+            let _ = self
+                .events
+                .send(AgentEvent {
+                    namespace: self.namespace.clone(),
+                    engine: self.config.engine,
+                    stream: EventStreamKind::Status,
+                    line: format!("exited:{status}"),
+                })
+                .await;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 #[async_trait]
@@ -537,6 +560,37 @@ done
 
         assert!(status.running);
         assert!(status.pid.is_some());
+    }
+
+    #[tokio::test]
+    async fn reap_if_exited_clears_finished_child() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("exit-agent");
+        write_script(
+            &bin,
+            r#"#!/usr/bin/env bash
+echo "done"
+exit 0
+"#,
+        );
+        let config = EngineConfig::new(AgentEngine::Claude, bin);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        let _ = next_event(&mut events).await;
+        let exited = timeout(Duration::from_secs(2), async {
+            loop {
+                if harness.reap_if_exited().await.unwrap() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(exited);
+        assert!(!harness.status().running);
     }
 
     #[test]

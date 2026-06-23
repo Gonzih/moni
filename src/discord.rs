@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serenity::{
@@ -6,12 +6,13 @@ use serenity::{
     model::{
         channel::Message,
         gateway::{GatewayIntents, Ready},
-        id::ChannelId,
     },
     prelude::*,
 };
 
+use crate::app::MoniApp;
 use crate::queue::{NamespaceQueue, QueuedPrompt};
+use crate::registry::BindingRegistry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelBinding {
@@ -45,34 +46,29 @@ pub async fn route_discord_message<Q: NamespaceQueue + ?Sized>(
 #[derive(Debug, Clone)]
 pub struct DiscordBotConfig {
     pub token: String,
-    pub bindings: HashMap<ChannelId, ChannelBinding>,
+    pub bindings: Vec<ChannelBinding>,
 }
 
 impl DiscordBotConfig {
     pub fn new(token: impl Into<String>, bindings: Vec<ChannelBinding>) -> anyhow::Result<Self> {
-        let mut by_channel = HashMap::new();
-        for binding in bindings {
-            let channel_id = binding.channel_id.parse::<u64>()?;
-            by_channel.insert(ChannelId::new(channel_id), binding);
+        for binding in &bindings {
+            binding.channel_id.parse::<u64>()?;
         }
         Ok(Self {
             token: token.into(),
-            bindings: by_channel,
+            bindings,
         })
     }
 }
 
 pub struct MoniDiscordHandler {
-    queue: Arc<dyn NamespaceQueue>,
-    bindings: HashMap<ChannelId, ChannelBinding>,
+    app: Arc<MoniApp>,
+    registry: BindingRegistry,
 }
 
 impl MoniDiscordHandler {
-    pub fn new(
-        queue: Arc<dyn NamespaceQueue>,
-        bindings: HashMap<ChannelId, ChannelBinding>,
-    ) -> Self {
-        Self { queue, bindings }
+    pub fn new(app: Arc<MoniApp>, registry: BindingRegistry) -> Self {
+        Self { app, registry }
     }
 }
 
@@ -87,17 +83,24 @@ impl EventHandler for MoniDiscordHandler {
             return;
         }
 
-        let Some(binding) = self.bindings.get(&message.channel_id) else {
-            return;
-        };
-
         let inbound = DiscordInboundMessage {
             channel_id: message.channel_id.to_string(),
             author_id: message.author.id.to_string(),
             body: message.content,
         };
 
-        if let Err(err) = route_discord_message(self.queue.as_ref(), binding, inbound).await {
+        let Some(binding) = self.registry.get_by_channel(message.channel_id).await else {
+            if let Err(err) = self
+                .app
+                .handle_unbound_discord_message(message.channel_id.to_string(), inbound)
+                .await
+            {
+                tracing::error!(channel_id = %message.channel_id, error = %err, "failed to handle unbound discord message");
+            }
+            return;
+        };
+
+        if let Err(err) = self.app.handle_discord_message(&binding, inbound).await {
             tracing::error!(channel_id = %binding.channel_id, namespace = %binding.namespace, error = %err, "failed to route discord message");
         }
     }
@@ -105,12 +108,13 @@ impl EventHandler for MoniDiscordHandler {
 
 pub async fn run_discord_bot(
     config: DiscordBotConfig,
-    queue: Arc<dyn NamespaceQueue>,
+    app: Arc<MoniApp>,
+    registry: BindingRegistry,
 ) -> anyhow::Result<()> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
-    let handler = MoniDiscordHandler::new(queue, config.bindings);
+    let handler = MoniDiscordHandler::new(app, registry);
     let mut client = Client::builder(config.token, intents)
         .event_handler(handler)
         .await?;
@@ -287,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn bot_config_indexes_bindings_by_channel_id() {
+    fn bot_config_keeps_validated_bindings() {
         let config = DiscordBotConfig::new(
             "token",
             vec![ChannelBinding {
@@ -299,10 +303,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.token, "token");
-        assert_eq!(
-            config.bindings.get(&ChannelId::new(123)).unwrap().namespace,
-            "moni"
-        );
+        assert_eq!(config.bindings[0].namespace, "moni");
     }
 
     #[test]
@@ -321,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_channel_bindings_last_one_wins() {
+    fn bot_config_preserves_duplicate_bindings_for_registry_resolution() {
         let config = DiscordBotConfig::new(
             "token",
             vec![
@@ -339,9 +340,9 @@ mod tests {
         )
         .unwrap();
 
-        let binding = config.bindings.get(&ChannelId::new(123)).unwrap();
-        assert_eq!(binding.namespace, "new");
-        assert_eq!(binding.repo_url, "new-repo");
+        assert_eq!(config.bindings.len(), 2);
+        assert_eq!(config.bindings[0].namespace, "old");
+        assert_eq!(config.bindings[1].namespace, "new");
     }
 
     #[test]

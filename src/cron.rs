@@ -88,7 +88,34 @@ impl CronEngine {
         &self.tasks
     }
 
-    pub async fn tick<Q: NamespaceQueue>(
+    pub fn add(&mut self, task: CronTask) {
+        self.tasks.push(task);
+    }
+
+    pub fn pause(&mut self, id: &str) -> bool {
+        self.set_status(id, CronTaskStatus::Paused)
+    }
+
+    pub fn resume(&mut self, id: &str) -> bool {
+        self.set_status(id, CronTaskStatus::Active)
+    }
+
+    pub fn delete(&mut self, id: &str) -> bool {
+        let before = self.tasks.len();
+        self.tasks.retain(|task| task.id != id);
+        self.tasks.len() != before
+    }
+
+    fn set_status(&mut self, id: &str, status: CronTaskStatus) -> bool {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) else {
+            return false;
+        };
+        task.status = status;
+        task.updated_at = Utc::now();
+        true
+    }
+
+    pub async fn tick<Q: NamespaceQueue + ?Sized>(
         &mut self,
         queue: &Q,
         now: DateTime<Utc>,
@@ -399,5 +426,52 @@ mod tests {
         let encoded = serde_json::to_string(&task).unwrap();
         let decoded: CronTask = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, task);
+    }
+
+    #[test]
+    fn add_appends_task() {
+        let mut engine = CronEngine::default();
+        engine.add(CronTask::new("moni", "repo", "* * * * *", "run"));
+        assert_eq!(engine.tasks().len(), 1);
+    }
+
+    #[test]
+    fn pause_existing_task() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.id = "c1".to_string();
+        let mut engine = CronEngine::new(vec![task]);
+        assert!(engine.pause("c1"));
+        assert_eq!(engine.tasks()[0].status, CronTaskStatus::Paused);
+    }
+
+    #[test]
+    fn pause_missing_task_returns_false() {
+        let mut engine = CronEngine::default();
+        assert!(!engine.pause("missing"));
+    }
+
+    #[test]
+    fn resume_existing_task() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.id = "c1".to_string();
+        task.status = CronTaskStatus::Paused;
+        let mut engine = CronEngine::new(vec![task]);
+        assert!(engine.resume("c1"));
+        assert_eq!(engine.tasks()[0].status, CronTaskStatus::Active);
+    }
+
+    #[test]
+    fn delete_existing_task() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+        task.id = "c1".to_string();
+        let mut engine = CronEngine::new(vec![task]);
+        assert!(engine.delete("c1"));
+        assert!(engine.tasks().is_empty());
+    }
+
+    #[test]
+    fn delete_missing_task_returns_false() {
+        let mut engine = CronEngine::default();
+        assert!(!engine.delete("missing"));
     }
 }
