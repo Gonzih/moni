@@ -183,7 +183,7 @@ done
         sink: &InMemoryOutputSink,
         count: usize,
     ) -> Vec<crate::output::OutputMessage> {
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(5), async {
             loop {
                 let messages = sink.messages().await;
                 if messages.len() >= count {

@@ -48,4 +48,11 @@ The implementation now covers the core replacement path in-process:
 
 Discord message -> NATS namespace subject -> NATS consumer -> persistent agent harness -> stdout -> Discord output sink.
 
-The remaining confidence gap is live external validation with real Discord and NATS services. Unit and integration-style tests currently cover the runtime seams with mock agents, memory queues, dynamic registration, state persistence, cron, and process lifecycle.
+Live NATS validation has been run with Docker:
+
+```bash
+docker run -d --rm -p 4224:4222 nats:2-alpine
+MONI_TEST_NATS_URL=nats://127.0.0.1:4224 cargo test live_nats_publish_reaches_session_manager_when_configured -- --nocapture
+```
+
+The remaining confidence gap is live Discord validation with a real bot token/guild/channel. Unit and integration-style tests cover the runtime seams with mock agents, memory queues, dynamic registration, state persistence, cron, process lifecycle, and live NATS publish/consume behavior.

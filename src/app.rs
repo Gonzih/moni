@@ -253,8 +253,9 @@ mod tests {
 
     use crate::{
         engine::{AgentEngine, EngineConfig},
+        nats::{NatsNamespaceQueue, run_nats_prompt_consumer},
         output::InMemoryOutputSink,
-        queue::{InMemoryNamespaceQueue, QueuedPrompt},
+        queue::{InMemoryNamespaceQueue, NamespaceQueue, QueuedPrompt},
         session::StaticEngineConfigResolver,
     };
 
@@ -507,5 +508,47 @@ done
             .unwrap();
 
         assert_eq!(wait_for_output(&output, 1).await[0].body, "agent:hello");
+    }
+
+    #[tokio::test]
+    async fn live_nats_publish_reaches_session_manager_when_configured() {
+        let Ok(nats_url) = std::env::var("MONI_TEST_NATS_URL") else {
+            return;
+        };
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let output = InMemoryOutputSink::default();
+        let client = async_nats::connect(&nats_url).await.unwrap();
+        let queue = NatsNamespaceQueue::new(client.clone());
+        let resolver = Arc::new(StaticEngineConfigResolver::new(EngineConfig::new(
+            AgentEngine::Claude,
+            bin,
+        )));
+        let sessions = Arc::new(SessionManager::new(
+            dir.path().join("workspaces"),
+            resolver,
+            Arc::new(output.clone()),
+        ));
+        let app = Arc::new(MoniApp::new(MoniAppConfig {
+            queue: Arc::new(queue.clone()),
+            sessions,
+            output: Arc::new(output.clone()),
+            cron: CronEngine::default(),
+            registry: BindingRegistry::new([binding()]).unwrap(),
+            state_store: None,
+        }));
+        let consumer = tokio::spawn(run_nats_prompt_consumer(client, app));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        queue
+            .enqueue(QueuedPrompt::new("moni", None, "from-nats", "test"))
+            .await
+            .unwrap();
+
+        let messages = wait_for_output(&output, 1).await;
+        consumer.abort();
+
+        assert_eq!(messages[0].body, "agent:from-nats");
     }
 }
