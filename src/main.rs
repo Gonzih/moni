@@ -72,7 +72,8 @@ async fn main() -> anyhow::Result<()> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let discord_config = DiscordBotConfig::new(token.clone(), bindings.clone())?
-        .with_allowed_user_ids(allowed_user_ids)?;
+        .with_allowed_user_ids(allowed_user_ids)?
+        .with_default_category_id(env::var("MONI_DEFAULT_CATEGORY_ID").ok())?;
     let nats_queue = NatsNamespaceQueue::connect(&nats_url).await?;
     let typing = DiscordTypingTracker::default();
     let output = Arc::new(

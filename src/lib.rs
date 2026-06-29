@@ -16,7 +16,7 @@ pub use commands::{CommandAction, ParsedCommand, parse_command};
 pub use cron::{CronEngine, CronTask, CronTaskStatus};
 pub use discord::{
     ChannelBinding, DiscordBotConfig, DiscordInboundMessage, MoniDiscordHandler,
-    parse_channel_bindings, route_discord_message, run_discord_bot,
+    parse_channel_bindings, parse_channel_create_intent, route_discord_message, run_discord_bot,
 };
 pub use engine::{AgentEngine, AgentProtocol, EngineConfig};
 pub use harness::{

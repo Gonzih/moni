@@ -86,6 +86,11 @@ impl MoniApp {
         Ok(())
     }
 
+    pub async fn register_binding(&self, binding: ChannelBinding) -> anyhow::Result<()> {
+        self.registry.upsert(binding).await?;
+        self.persist_state().await
+    }
+
     pub async fn handle_queued_prompt(
         &self,
         prompt: crate::queue::QueuedPrompt,

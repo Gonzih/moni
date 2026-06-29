@@ -2,10 +2,19 @@
 set -eu
 
 OLD_PLIST="$HOME/Library/LaunchAgents/com.feral.cc-discord.plist"
+OLD_PLIST_BACKUP="$HOME/.local/share/cc-discord/backups/com.feral.cc-discord.plist.20260622153109"
 OLD_GITKB="$HOME/.local/share/cc-discord/run-with-gitkb-env.sh"
 
+if [ ! -f "$OLD_PLIST" ] && [ -f "$OLD_PLIST_BACKUP" ]; then
+  OLD_PLIST="$OLD_PLIST_BACKUP"
+fi
+
 plist_value() {
-  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$OLD_PLIST" 2>/dev/null || true
+  if [ ! -f "$OLD_PLIST" ]; then
+    return 0
+  fi
+  VALUE="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$OLD_PLIST" 2>/dev/null)" || return 0
+  printf '%s\n' "$VALUE"
 }
 
 OLD_PATH="$(plist_value PATH)"
@@ -16,6 +25,12 @@ fi
 export MONI_DISCORD_TOKEN="$(plist_value DISCORD_BOT_TOKEN)"
 ALLOWED_USER_IDS="$(plist_value DISCORD_ALLOWED_USER_IDS)"
 CODEX_BIN="$(plist_value CODEX_BIN)"
+DEFAULT_CATEGORY_ID="$(plist_value DISCORD_DEFAULT_CATEGORY_ID)"
+
+if [ -z "$MONI_DISCORD_TOKEN" ]; then
+  echo "missing DISCORD_BOT_TOKEN from $OLD_PLIST" >&2
+  exit 1
+fi
 
 export MONI_NATS_URL="nats://127.0.0.1:4222"
 export MONI_CHANNELS="1514478248057110618=cron=https://github.com/gonzih/cron,1514524404745240609=cc-wire=https://github.com/gonzih/cc-wire,1514658379384229938=money-brain=https://github.com/gonzih/money-brain,1514659822794969309=simorgh-mobile-app=https://github.com/gonzih/simorgh-mobile-app,1514676507124170885=of-stack=https://github.com/gonzih/of-stack,1514676615668305971=simorgh-web-app=https://github.com/gonzih/simorgh-web-app,1514743825736798369=metaweb-future-path=https://github.com/gonzih/metaweb-future-path,1514785858887352400=nexus-souls=https://github.com/gonzih/nexus-souls,1517279248023290017=recruitment=https://github.com/gonzih/recruitment,1517331011187511398=nexus-research=https://github.com/gonzih/nexus-research,1517695980949078048=cc-suite-tests=https://github.com/gonzih/cc-suite-tests,1517709847053734051=cc-suite=https://github.com/gonzih/cc-suite,1518796075572396123=harmony=https://github.com/gitkb/harmony"
@@ -25,6 +40,7 @@ export MONI_ENGINE="codex"
 export MONI_AGENT_BIN="${CODEX_BIN:-/opt/homebrew/bin/codex}"
 export MONI_CODEX_APP_SERVER="1"
 export MONI_ALLOWED_USER_IDS="$ALLOWED_USER_IDS"
+export MONI_DEFAULT_CATEGORY_ID="$DEFAULT_CATEGORY_ID"
 export MONI_CRON_TICK_SECONDS="30"
 export RUST_LOG="moni=info,warn"
 

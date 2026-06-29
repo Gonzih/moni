@@ -3,9 +3,11 @@ use std::{collections::HashSet, sync::Arc};
 use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait as serenity_async_trait,
+    builder::CreateChannel,
     model::{
-        channel::Message,
+        channel::{ChannelType, Message},
         gateway::{GatewayIntents, Ready},
+        id::ChannelId,
     },
     prelude::*,
 };
@@ -29,6 +31,12 @@ pub struct DiscordInboundMessage {
     pub body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCreateIntent {
+    pub namespace: String,
+    pub repo_url: String,
+}
+
 pub async fn route_discord_message<Q: NamespaceQueue + ?Sized>(
     queue: &Q,
     binding: &ChannelBinding,
@@ -49,6 +57,7 @@ pub struct DiscordBotConfig {
     pub token: String,
     pub bindings: Vec<ChannelBinding>,
     pub allowed_user_ids: Vec<String>,
+    pub default_category_id: Option<ChannelId>,
 }
 
 impl DiscordBotConfig {
@@ -60,6 +69,7 @@ impl DiscordBotConfig {
             token: token.into(),
             bindings,
             allowed_user_ids: Vec::new(),
+            default_category_id: None,
         })
     }
 
@@ -70,6 +80,17 @@ impl DiscordBotConfig {
         self.allowed_user_ids = allowed_user_ids;
         Ok(self)
     }
+
+    pub fn with_default_category_id(
+        mut self,
+        default_category_id: Option<String>,
+    ) -> anyhow::Result<Self> {
+        self.default_category_id = default_category_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().parse::<u64>().map(ChannelId::new))
+            .transpose()?;
+        Ok(self)
+    }
 }
 
 pub struct MoniDiscordHandler {
@@ -77,6 +98,7 @@ pub struct MoniDiscordHandler {
     registry: BindingRegistry,
     allowed_user_ids: HashSet<String>,
     typing: DiscordTypingTracker,
+    default_category_id: Option<ChannelId>,
 }
 
 impl MoniDiscordHandler {
@@ -85,17 +107,60 @@ impl MoniDiscordHandler {
         registry: BindingRegistry,
         allowed_user_ids: impl IntoIterator<Item = String>,
         typing: DiscordTypingTracker,
+        default_category_id: Option<ChannelId>,
     ) -> Self {
         Self {
             app,
             registry,
             allowed_user_ids: allowed_user_ids.into_iter().collect(),
             typing,
+            default_category_id,
         }
     }
 
     fn is_authorized(&self, author_id: &str) -> bool {
         self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(author_id)
+    }
+
+    async fn handle_channel_create_intent(
+        &self,
+        ctx: &Context,
+        message: &Message,
+        intent: ChannelCreateIntent,
+    ) -> anyhow::Result<()> {
+        let Some(guild_id) = message.guild_id else {
+            message
+                .channel_id
+                .say(&ctx.http, "channel creation only works in a server")
+                .await?;
+            return Ok(());
+        };
+
+        let mut builder = CreateChannel::new(discord_channel_name(&intent.namespace))
+            .kind(ChannelType::Text)
+            .topic(format!("moni route for {}", intent.repo_url));
+        if let Some(category_id) = self.default_category_id {
+            builder = builder.category(category_id);
+        }
+
+        let channel = guild_id.create_channel(&ctx.http, builder).await?;
+        let binding = ChannelBinding {
+            channel_id: channel.id.to_string(),
+            namespace: intent.namespace,
+            repo_url: intent.repo_url,
+        };
+        self.app.register_binding(binding.clone()).await?;
+        message
+            .channel_id
+            .say(
+                &ctx.http,
+                format!(
+                    "Created <#{}> - messages there route to the {} meta-agent",
+                    binding.channel_id, binding.repo_url
+                ),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -116,6 +181,20 @@ impl EventHandler for MoniDiscordHandler {
                 channel_id = %message.channel_id,
                 "ignored Discord message from unauthorized user"
             );
+            return;
+        }
+
+        if let Some(intent) = parse_channel_create_intent(&message.content) {
+            if let Err(err) = self
+                .handle_channel_create_intent(&ctx, &message, intent)
+                .await
+            {
+                tracing::error!(channel_id = %message.channel_id, error = %err, "failed to create Discord channel binding");
+                let _ = message
+                    .channel_id
+                    .say(&ctx.http, format!("channel creation failed: {err}"))
+                    .await;
+            }
             return;
         }
 
@@ -162,7 +241,13 @@ pub async fn run_discord_bot(
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
-    let handler = MoniDiscordHandler::new(app, registry, config.allowed_user_ids, typing);
+    let handler = MoniDiscordHandler::new(
+        app,
+        registry,
+        config.allowed_user_ids,
+        typing,
+        config.default_category_id,
+    );
     let mut client = Client::builder(config.token, intents)
         .event_handler(handler)
         .await?;
@@ -190,6 +275,61 @@ pub fn parse_channel_bindings(input: &str) -> anyhow::Result<Vec<ChannelBinding>
         });
     }
     Ok(bindings)
+}
+
+pub fn parse_channel_create_intent(text: &str) -> Option<ChannelCreateIntent> {
+    let lower = text.to_ascii_lowercase();
+    let marker = "channel for ";
+    let marker_index = lower.find(marker)?;
+    let url_start = marker_index + marker.len();
+    let rest = text.get(url_start..)?.trim_start();
+    let url = rest
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ')' | ']' | '>'));
+    let repo_path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let mut segments = repo_path.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if owner.is_empty() || repo.is_empty() || !is_github_segment(owner) || !is_github_segment(repo)
+    {
+        return None;
+    }
+    Some(ChannelCreateIntent {
+        namespace: repo.to_string(),
+        repo_url: format!("{}{}", &url[..url.len() - repo_path.len()], owner) + "/" + repo,
+    })
+}
+
+fn is_github_segment(segment: &str) -> bool {
+    segment
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+fn discord_channel_name(namespace: &str) -> String {
+    let mut name = namespace
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while name.contains("--") {
+        name = name.replace("--", "-");
+    }
+    let name = name.trim_matches('-');
+    if name.len() >= 2 {
+        name.to_string()
+    } else {
+        "moni-channel".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +376,30 @@ mod tests {
         assert_eq!(bindings[0].namespace, "moni");
         assert_eq!(bindings[0].repo_url, "https://github.com/example/moni");
         assert_eq!(bindings[1].repo_url, "ssh://git@example.com/repo");
+    }
+
+    #[test]
+    fn parses_channel_create_intent() {
+        let intent =
+            parse_channel_create_intent("channel for https://github.com/Gonzih/moni").unwrap();
+
+        assert_eq!(intent.namespace, "moni");
+        assert_eq!(intent.repo_url, "https://github.com/Gonzih/moni");
+    }
+
+    #[test]
+    fn parses_channel_create_intent_with_optional_verb() {
+        let intent =
+            parse_channel_create_intent("add channel for https://github.com/gitkb/harmony.")
+                .unwrap();
+
+        assert_eq!(intent.namespace, "harmony");
+        assert_eq!(intent.repo_url, "https://github.com/gitkb/harmony");
+    }
+
+    #[test]
+    fn ignores_non_github_channel_create_intent() {
+        assert!(parse_channel_create_intent("channel for https://example.com/a/b").is_none());
     }
 
     #[tokio::test]
@@ -375,6 +539,16 @@ mod tests {
     }
 
     #[test]
+    fn bot_config_accepts_default_category_id() {
+        let config = DiscordBotConfig::new("token", Vec::new())
+            .unwrap()
+            .with_default_category_id(Some("123".to_string()))
+            .unwrap();
+
+        assert_eq!(config.default_category_id, Some(ChannelId::new(123)));
+    }
+
+    #[test]
     fn empty_allowed_user_list_authorizes_everyone() {
         let handler = MoniDiscordHandler {
             app: Arc::new(MoniApp::new(crate::app::MoniAppConfig {
@@ -394,6 +568,7 @@ mod tests {
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             allowed_user_ids: HashSet::new(),
             typing: DiscordTypingTracker::default(),
+            default_category_id: None,
         };
 
         assert!(handler.is_authorized("42"));
@@ -419,6 +594,7 @@ mod tests {
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             allowed_user_ids: HashSet::from(["42".to_string()]),
             typing: DiscordTypingTracker::default(),
+            default_category_id: None,
         };
 
         assert!(handler.is_authorized("42"));
