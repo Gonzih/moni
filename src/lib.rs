@@ -24,7 +24,9 @@ pub use harness::{
     ProcessAgentHarness, StopReason,
 };
 pub use nats::NatsNamespaceQueue;
-pub use output::{DiscordOutputSink, InMemoryOutputSink, OutputMessage, OutputSink};
+pub use output::{
+    DiscordOutputSink, DiscordTypingTracker, InMemoryOutputSink, OutputMessage, OutputSink,
+};
 pub use queue::{
     InMemoryNamespaceQueue, NamespaceQueue, QueuedPrompt, subject_for_namespace_input,
 };

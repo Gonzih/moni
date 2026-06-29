@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use serenity::{http::Http, model::id::ChannelId};
-use tokio::{
-    sync::Mutex,
-    time::{Duration, sleep},
+use serenity::{
+    http::{Http, Typing},
+    model::id::ChannelId,
 };
+use tokio::{sync::Mutex, time::sleep};
 
 use crate::harness::{AgentEvent, EventStreamKind};
 use crate::registry::BindingRegistry;
@@ -22,6 +22,38 @@ pub struct OutputMessage {
 #[async_trait]
 pub trait OutputSink: Send + Sync {
     async fn send(&self, message: OutputMessage) -> anyhow::Result<()>;
+}
+
+#[derive(Clone, Default)]
+pub struct DiscordTypingTracker {
+    active: Arc<Mutex<HashMap<String, Typing>>>,
+}
+
+impl DiscordTypingTracker {
+    pub async fn start(
+        &self,
+        namespace: impl Into<String>,
+        channel_id: ChannelId,
+        http: &Arc<Http>,
+    ) {
+        let namespace = namespace.into();
+        let typing = channel_id.start_typing(http);
+        if let Some(previous) = self.active.lock().await.insert(namespace.clone(), typing) {
+            previous.stop();
+        }
+
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15 * 60)).await;
+            tracker.stop(&namespace).await;
+        });
+    }
+
+    pub async fn stop(&self, namespace: &str) {
+        if let Some(typing) = self.active.lock().await.remove(namespace) {
+            typing.stop();
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -47,6 +79,7 @@ impl OutputSink for InMemoryOutputSink {
 pub struct DiscordOutputSink {
     http: Arc<Http>,
     registry: BindingRegistry,
+    typing: Option<DiscordTypingTracker>,
 }
 
 impl DiscordOutputSink {
@@ -72,13 +105,23 @@ impl DiscordOutputSink {
         Self {
             http: Arc::new(Http::new(token.as_ref())),
             registry,
+            typing: None,
         }
+    }
+
+    pub fn with_typing_tracker(mut self, typing: DiscordTypingTracker) -> Self {
+        self.typing = Some(typing);
+        self
     }
 }
 
 #[async_trait]
 impl OutputSink for DiscordOutputSink {
     async fn send(&self, message: OutputMessage) -> anyhow::Result<()> {
+        if let Some(typing) = &self.typing {
+            typing.stop(&message.namespace).await;
+        }
+
         let Some(channel_id) = self
             .registry
             .channel_for_namespace(&message.namespace)

@@ -2,8 +2,9 @@ use std::{env, sync::Arc, time::Duration};
 
 use moni::{
     AgentEngine, AgentProtocol, BindingRegistry, CronEngine, DiscordBotConfig, DiscordOutputSink,
-    EngineConfig, FileStateStore, MoniApp, MoniAppConfig, NatsNamespaceQueue, SessionManager,
-    StateStore, StaticEngineConfigResolver, parse_channel_bindings, run_discord_bot,
+    DiscordTypingTracker, EngineConfig, FileStateStore, MoniApp, MoniAppConfig, NatsNamespaceQueue,
+    SessionManager, StateStore, StaticEngineConfigResolver, parse_channel_bindings,
+    run_discord_bot,
 };
 
 #[tokio::main]
@@ -73,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
     let discord_config = DiscordBotConfig::new(token.clone(), bindings.clone())?
         .with_allowed_user_ids(allowed_user_ids)?;
     let nats_queue = NatsNamespaceQueue::connect(&nats_url).await?;
-    let output = Arc::new(DiscordOutputSink::with_registry(token, registry.clone()));
+    let typing = DiscordTypingTracker::default();
+    let output = Arc::new(
+        DiscordOutputSink::with_registry(token, registry.clone())
+            .with_typing_tracker(typing.clone()),
+    );
     let protocol = if codex_app_server {
         AgentProtocol::CodexAppServer
     } else {
@@ -99,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     tokio::select! {
-        result = run_discord_bot(discord_config, app.clone(), registry) => result,
+        result = run_discord_bot(discord_config, app.clone(), registry, typing) => result,
         result = moni::nats::run_nats_prompt_consumer(nats_queue.client(), app.clone()) => result,
         result = moni::run_cron_loop(app, Duration::from_secs(cron_tick_seconds)) => result,
     }

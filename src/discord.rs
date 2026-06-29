@@ -11,6 +11,7 @@ use serenity::{
 };
 
 use crate::app::MoniApp;
+use crate::output::DiscordTypingTracker;
 use crate::queue::{NamespaceQueue, QueuedPrompt};
 use crate::registry::BindingRegistry;
 
@@ -75,6 +76,7 @@ pub struct MoniDiscordHandler {
     app: Arc<MoniApp>,
     registry: BindingRegistry,
     allowed_user_ids: HashSet<String>,
+    typing: DiscordTypingTracker,
 }
 
 impl MoniDiscordHandler {
@@ -82,11 +84,13 @@ impl MoniDiscordHandler {
         app: Arc<MoniApp>,
         registry: BindingRegistry,
         allowed_user_ids: impl IntoIterator<Item = String>,
+        typing: DiscordTypingTracker,
     ) -> Self {
         Self {
             app,
             registry,
             allowed_user_ids: allowed_user_ids.into_iter().collect(),
+            typing,
         }
     }
 
@@ -101,7 +105,7 @@ impl EventHandler for MoniDiscordHandler {
         tracing::info!(user = %ready.user.name, "moni discord gateway ready");
     }
 
-    async fn message(&self, _ctx: Context, message: Message) {
+    async fn message(&self, ctx: Context, message: Message) {
         if message.author.bot {
             return;
         }
@@ -139,7 +143,11 @@ impl EventHandler for MoniDiscordHandler {
             namespace = %binding.namespace,
             "routing Discord message"
         );
+        self.typing
+            .start(binding.namespace.clone(), message.channel_id, &ctx.http)
+            .await;
         if let Err(err) = self.app.handle_discord_message(&binding, inbound).await {
+            self.typing.stop(&binding.namespace).await;
             tracing::error!(channel_id = %binding.channel_id, namespace = %binding.namespace, error = %err, "failed to route discord message");
         }
     }
@@ -149,11 +157,12 @@ pub async fn run_discord_bot(
     config: DiscordBotConfig,
     app: Arc<MoniApp>,
     registry: BindingRegistry,
+    typing: DiscordTypingTracker,
 ) -> anyhow::Result<()> {
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
-    let handler = MoniDiscordHandler::new(app, registry, config.allowed_user_ids);
+    let handler = MoniDiscordHandler::new(app, registry, config.allowed_user_ids, typing);
     let mut client = Client::builder(config.token, intents)
         .event_handler(handler)
         .await?;
@@ -384,6 +393,7 @@ mod tests {
             })),
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             allowed_user_ids: HashSet::new(),
+            typing: DiscordTypingTracker::default(),
         };
 
         assert!(handler.is_authorized("42"));
@@ -408,6 +418,7 @@ mod tests {
             })),
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             allowed_user_ids: HashSet::from(["42".to_string()]),
+            typing: DiscordTypingTracker::default(),
         };
 
         assert!(handler.is_authorized("42"));
