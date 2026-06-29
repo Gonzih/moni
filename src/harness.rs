@@ -399,11 +399,7 @@ async fn handle_codex_app_server_line(
         return;
     }
 
-    if let Some(thread_id) = message
-        .pointer("/result/thread/id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    {
+    if let Some(thread_id) = codex_thread_id(&message, "/result") {
         state.lock().await.thread_id = Some(thread_id);
         return;
     }
@@ -414,20 +410,16 @@ async fn handle_codex_app_server_line(
 
     match method {
         "thread/started" => {
-            if let Some(thread_id) = message
-                .pointer("/params/thread/id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            {
+            if let Some(thread_id) = codex_thread_id(&message, "/params") {
                 state.lock().await.thread_id = Some(thread_id);
             }
         }
-        "agentMessageDelta" => {
+        "agentMessageDelta" | "item/agentMessage/delta" => {
             if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
                 state.lock().await.pending_message.push_str(delta);
             }
         }
-        "turnCompleted" => {
+        "turnCompleted" | "turn/completed" => {
             let mut state = state.lock().await;
             let body = state.pending_message.trim().to_string();
             state.pending_message.clear();
@@ -449,6 +441,15 @@ async fn handle_codex_app_server_line(
         }
         _ => {}
     }
+}
+
+fn codex_thread_id(message: &Value, root: &str) -> Option<String> {
+    ["/thread/id", "/threadId"].into_iter().find_map(|path| {
+        message
+            .pointer(&format!("{root}{path}"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 async fn emit_agent_event(
@@ -819,9 +820,9 @@ while IFS= read -r line; do
   if [[ "$line" == *'"method":"thread/start"'* ]]; then
     echo '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
   elif [[ "$line" == *'"method":"turn/start"'* ]]; then
-    echo '{"method":"agentMessageDelta","params":{"delta":"hello "}}'
-    echo '{"method":"agentMessageDelta","params":{"delta":"codex"}}'
-    echo '{"method":"turnCompleted","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}'
+    echo '{"method":"item/agentMessage/delta","params":{"delta":"hello ","itemId":"item-1","threadId":"thread-1","turnId":"turn-1"}}'
+    echo '{"method":"item/agentMessage/delta","params":{"delta":"codex","itemId":"item-1","threadId":"thread-1","turnId":"turn-1"}}'
+    echo '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}'
   fi
 done
 "#,
@@ -837,6 +838,43 @@ done
         for _ in 0..4 {
             let event = next_event(&mut events).await;
             if event.stream == EventStreamKind::Stdout && event.line == "hello codex" {
+                saw_output = true;
+                break;
+            }
+        }
+        harness.stop(StopReason::Shutdown).await.unwrap();
+
+        assert!(saw_output);
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_protocol_accepts_legacy_delta_names() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("codex-app-server");
+        write_script(
+            &bin,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  if [[ "$line" == *'"method":"thread/start"'* ]]; then
+    echo '{"method":"thread/started","params":{"threadId":"thread-1"}}'
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    echo '{"method":"agentMessageDelta","params":{"delta":"legacy"}}'
+    echo '{"method":"turnCompleted","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}'
+  fi
+done
+"#,
+        );
+        let config =
+            EngineConfig::new(AgentEngine::Codex, bin).with_protocol(AgentProtocol::CodexAppServer);
+        let (mut harness, mut events) = ProcessAgentHarness::new("moni", dir.path(), config);
+
+        harness.start().await.unwrap();
+        harness.send("run").await.unwrap();
+
+        let mut saw_output = false;
+        for _ in 0..4 {
+            let event = next_event(&mut events).await;
+            if event.stream == EventStreamKind::Stdout && event.line == "legacy" {
                 saw_output = true;
                 break;
             }

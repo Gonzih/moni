@@ -51,10 +51,27 @@ pub async fn run_nats_prompt_consumer(
 ) -> anyhow::Result<()> {
     let mut subscriber = client.subscribe("moni.namespace.*.input").await?;
     while let Some(message) = subscriber.next().await {
-        let prompt: QueuedPrompt = serde_json::from_slice(&message.payload)?;
-        app.handle_queued_prompt(prompt).await?;
+        let Ok(prompt) = decode_nats_prompt(&message.payload) else {
+            tracing::warn!(
+                subject = %message.subject,
+                "dropped invalid NATS prompt payload"
+            );
+            continue;
+        };
+
+        if let Err(err) = app.handle_queued_prompt(prompt).await {
+            tracing::error!(
+                subject = %message.subject,
+                error = %err,
+                "failed to handle NATS prompt"
+            );
+        }
     }
     Ok(())
+}
+
+fn decode_nats_prompt(payload: &[u8]) -> anyhow::Result<QueuedPrompt> {
+    Ok(serde_json::from_slice(payload)?)
 }
 
 #[cfg(test)]
@@ -72,11 +89,18 @@ mod tests {
     fn encodes_prompt_payload_as_json() {
         let prompt = QueuedPrompt::new("moni", Some("https://repo".to_string()), "hello", "test");
         let (_, payload) = encode_nats_prompt(&prompt).unwrap();
-        let decoded: QueuedPrompt = serde_json::from_slice(&payload).unwrap();
+        let decoded = decode_nats_prompt(&payload).unwrap();
         assert_eq!(decoded.namespace, "moni");
         assert_eq!(decoded.repo_url.as_deref(), Some("https://repo"));
         assert_eq!(decoded.body, "hello");
         assert_eq!(decoded.source, "test");
+    }
+
+    #[test]
+    fn invalid_prompt_payload_is_decode_error() {
+        let err = decode_nats_prompt(br#"{"namespace":"missing-required-fields"}"#).unwrap_err();
+
+        assert!(err.to_string().contains("missing field"));
     }
 
     #[test]
