@@ -210,10 +210,7 @@ impl MoniApp {
 
     async fn ack(&self, namespace: &str, body: impl Into<String>) -> anyhow::Result<()> {
         self.output
-            .send(OutputMessage {
-                namespace: namespace.to_string(),
-                body: body.into(),
-            })
+            .send(OutputMessage::complete(namespace, body))
             .await
     }
 

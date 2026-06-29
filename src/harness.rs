@@ -27,6 +27,8 @@ pub enum EventStreamKind {
     Stdout,
     Stderr,
     Status,
+    Delta,
+    Final,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +419,7 @@ async fn handle_codex_app_server_line(
         "agentMessageDelta" | "item/agentMessage/delta" => {
             if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
                 state.lock().await.pending_message.push_str(delta);
+                emit_agent_event(events, namespace, engine, EventStreamKind::Delta, delta).await;
             }
         }
         "turnCompleted" | "turn/completed" => {
@@ -426,7 +429,7 @@ async fn handle_codex_app_server_line(
             drop(state);
 
             if !body.is_empty() {
-                emit_agent_event(events, namespace, engine, EventStreamKind::Stdout, body).await;
+                emit_agent_event(events, namespace, engine, EventStreamKind::Final, body).await;
             }
         }
         "error" => {
@@ -834,17 +837,22 @@ done
         harness.start().await.unwrap();
         harness.send("run").await.unwrap();
 
-        let mut saw_output = false;
-        for _ in 0..4 {
+        let mut saw_delta = false;
+        let mut saw_final = false;
+        for _ in 0..5 {
             let event = next_event(&mut events).await;
-            if event.stream == EventStreamKind::Stdout && event.line == "hello codex" {
-                saw_output = true;
+            if event.stream == EventStreamKind::Delta && event.line == "hello " {
+                saw_delta = true;
+            }
+            if event.stream == EventStreamKind::Final && event.line == "hello codex" {
+                saw_final = true;
                 break;
             }
         }
         harness.stop(StopReason::Shutdown).await.unwrap();
 
-        assert!(saw_output);
+        assert!(saw_delta);
+        assert!(saw_final);
     }
 
     #[tokio::test]
@@ -871,17 +879,22 @@ done
         harness.start().await.unwrap();
         harness.send("run").await.unwrap();
 
-        let mut saw_output = false;
-        for _ in 0..4 {
+        let mut saw_delta = false;
+        let mut saw_final = false;
+        for _ in 0..5 {
             let event = next_event(&mut events).await;
-            if event.stream == EventStreamKind::Stdout && event.line == "legacy" {
-                saw_output = true;
+            if event.stream == EventStreamKind::Delta && event.line == "legacy" {
+                saw_delta = true;
+            }
+            if event.stream == EventStreamKind::Final && event.line == "legacy" {
+                saw_final = true;
                 break;
             }
         }
         harness.stop(StopReason::Shutdown).await.unwrap();
 
-        assert!(saw_output);
+        assert!(saw_delta);
+        assert!(saw_final);
     }
 
     #[test]

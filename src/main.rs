@@ -3,8 +3,8 @@ use std::{env, sync::Arc, time::Duration};
 use moni::{
     AgentEngine, AgentProtocol, BindingRegistry, CronEngine, DiscordBotConfig, DiscordOutputSink,
     DiscordTypingTracker, EngineConfig, FileStateStore, MoniApp, MoniAppConfig, NatsNamespaceQueue,
-    SessionManager, StateStore, StaticEngineConfigResolver, parse_channel_bindings,
-    run_discord_bot,
+    SessionManager, StateStore, StaticEngineConfigResolver, VoiceTranscriber,
+    parse_channel_bindings, run_discord_bot,
 };
 
 #[tokio::main]
@@ -73,7 +73,14 @@ async fn main() -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     let discord_config = DiscordBotConfig::new(token.clone(), bindings.clone())?
         .with_allowed_user_ids(allowed_user_ids)?
-        .with_default_category_id(env::var("MONI_DEFAULT_CATEGORY_ID").ok())?;
+        .with_default_category_id(env::var("MONI_DEFAULT_CATEGORY_ID").ok())?
+        .with_voice_transcriber(match VoiceTranscriber::from_env() {
+            Ok(transcriber) => Some(transcriber),
+            Err(err) => {
+                tracing::warn!(error = %err, "voice transcription disabled");
+                None
+            }
+        });
     let nats_queue = NatsNamespaceQueue::connect(&nats_url).await?;
     let typing = DiscordTypingTracker::default();
     let output = Arc::new(

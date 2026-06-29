@@ -10,6 +10,7 @@ pub mod queue;
 pub mod registry;
 pub mod session;
 pub mod store;
+pub mod voice;
 
 pub use app::{MoniApp, MoniAppConfig, run_cron_loop};
 pub use commands::{CommandAction, ParsedCommand, parse_command};
@@ -33,3 +34,4 @@ pub use queue::{
 pub use registry::BindingRegistry;
 pub use session::{EngineConfigResolver, SessionManager, StaticEngineConfigResolver};
 pub use store::{FileStateStore, MoniState, StateStore};
+pub use voice::{VoiceTranscriber, build_voice_prompt, is_audio_attachment};

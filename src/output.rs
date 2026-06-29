@@ -2,21 +2,60 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serenity::{
+    builder::{CreateMessage, EditMessage},
     http::{Http, Typing},
-    model::id::ChannelId,
+    model::{channel::Message, id::ChannelId},
 };
-use tokio::{sync::Mutex, time::sleep};
+use tokio::{
+    sync::Mutex,
+    time::{Instant, sleep},
+};
 
 use crate::harness::{AgentEvent, EventStreamKind};
 use crate::registry::BindingRegistry;
 
 const DISCORD_MESSAGE_LIMIT: usize = 1900;
 const DISCORD_SEND_ATTEMPTS: usize = 3;
+const LIVE_EDIT_MIN_INTERVAL: Duration = Duration::from_millis(900);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputMessage {
     pub namespace: String,
     pub body: String,
+    pub kind: OutputMessageKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMessageKind {
+    Complete,
+    Delta,
+    Final,
+}
+
+impl OutputMessage {
+    pub fn complete(namespace: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            body: body.into(),
+            kind: OutputMessageKind::Complete,
+        }
+    }
+
+    pub fn delta(namespace: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            body: body.into(),
+            kind: OutputMessageKind::Delta,
+        }
+    }
+
+    pub fn final_message(namespace: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            body: body.into(),
+            kind: OutputMessageKind::Final,
+        }
+    }
 }
 
 #[async_trait]
@@ -80,6 +119,7 @@ pub struct DiscordOutputSink {
     http: Arc<Http>,
     registry: BindingRegistry,
     typing: Option<DiscordTypingTracker>,
+    live: Arc<Mutex<DiscordLiveMessages>>,
 }
 
 impl DiscordOutputSink {
@@ -106,6 +146,7 @@ impl DiscordOutputSink {
             http: Arc::new(Http::new(token.as_ref())),
             registry,
             typing: None,
+            live: Arc::new(Mutex::new(DiscordLiveMessages::default())),
         }
     }
 
@@ -118,10 +159,6 @@ impl DiscordOutputSink {
 #[async_trait]
 impl OutputSink for DiscordOutputSink {
     async fn send(&self, message: OutputMessage) -> anyhow::Result<()> {
-        if let Some(typing) = &self.typing {
-            typing.stop(&message.namespace).await;
-        }
-
         let Some(channel_id) = self
             .registry
             .channel_for_namespace(&message.namespace)
@@ -131,12 +168,160 @@ impl OutputSink for DiscordOutputSink {
             return Ok(());
         };
 
+        match message.kind {
+            OutputMessageKind::Delta => {
+                let mut live = self.live.lock().await;
+                live.apply_delta(
+                    &self.http,
+                    channel_id,
+                    &message.namespace,
+                    &message.body,
+                    self.typing.as_ref(),
+                )
+                .await?;
+                return Ok(());
+            }
+            OutputMessageKind::Final => {
+                if let Some(typing) = &self.typing {
+                    typing.stop(&message.namespace).await;
+                }
+                let mut live = self.live.lock().await;
+                if live
+                    .finalize(&self.http, channel_id, &message.namespace, &message.body)
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+            OutputMessageKind::Complete => {
+                if let Some(typing) = &self.typing {
+                    typing.stop(&message.namespace).await;
+                }
+            }
+        }
+
         for chunk in split_discord_message(&message.body) {
             send_discord_chunk(&self.http, channel_id, &chunk).await?;
         }
 
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct DiscordLiveMessages {
+    messages: HashMap<String, DiscordLiveMessage>,
+    next_edit_at: Option<Instant>,
+}
+
+struct DiscordLiveMessage {
+    message: Message,
+    text: String,
+}
+
+impl DiscordLiveMessages {
+    async fn apply_delta(
+        &mut self,
+        http: &Arc<Http>,
+        channel_id: ChannelId,
+        namespace: &str,
+        delta: &str,
+        typing: Option<&DiscordTypingTracker>,
+    ) -> anyhow::Result<()> {
+        if delta.is_empty() {
+            return Ok(());
+        }
+        if !self.messages.contains_key(namespace) {
+            if let Some(typing) = typing {
+                typing.stop(namespace).await;
+            }
+            let message = channel_id
+                .send_message(http, CreateMessage::new().content("..."))
+                .await?;
+            self.messages.insert(
+                namespace.to_string(),
+                DiscordLiveMessage {
+                    message,
+                    text: String::new(),
+                },
+            );
+            self.next_edit_at = Some(Instant::now() + LIVE_EDIT_MIN_INTERVAL);
+        }
+
+        let ready_to_edit = self.ready_to_edit();
+        let entry = self
+            .messages
+            .get_mut(namespace)
+            .expect("live message exists");
+        entry.text.push_str(delta);
+        if !ready_to_edit {
+            return Ok(());
+        }
+        let content = live_display(namespace, &entry.text);
+        edit_discord_message(http, &mut entry.message, &content).await?;
+        self.next_edit_at = Some(Instant::now() + LIVE_EDIT_MIN_INTERVAL);
+        Ok(())
+    }
+
+    async fn finalize(
+        &mut self,
+        http: &Arc<Http>,
+        channel_id: ChannelId,
+        namespace: &str,
+        body: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(mut entry) = self.messages.remove(namespace) else {
+            return Ok(false);
+        };
+        let chunks = split_discord_message(body);
+        edit_discord_message(http, &mut entry.message, &chunks[0]).await?;
+        for chunk in chunks.iter().skip(1) {
+            send_discord_chunk(http, channel_id, chunk).await?;
+        }
+        Ok(true)
+    }
+
+    fn ready_to_edit(&self) -> bool {
+        self.next_edit_at
+            .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(true)
+    }
+}
+
+async fn edit_discord_message(
+    http: &Arc<Http>,
+    message: &mut Message,
+    body: &str,
+) -> anyhow::Result<()> {
+    let mut delay = Duration::from_millis(500);
+    let mut last_error = None;
+    for attempt in 1..=DISCORD_SEND_ATTEMPTS {
+        match message
+            .edit(http, EditMessage::new().content(first_discord_chunk(body)))
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = DISCORD_SEND_ATTEMPTS,
+                    error = %err,
+                    "failed to edit Discord live output"
+                );
+                last_error = Some(err);
+                if attempt < DISCORD_SEND_ATTEMPTS {
+                    sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "failed to edit Discord output after {DISCORD_SEND_ATTEMPTS} attempts: {}",
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 async fn send_discord_chunk(
@@ -214,12 +399,22 @@ pub fn split_discord_message(body: &str) -> Vec<String> {
     chunks
 }
 
+fn first_discord_chunk(body: &str) -> String {
+    split_discord_message(body)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| " ".to_string())
+}
+
+fn live_display(namespace: &str, body: &str) -> String {
+    first_discord_chunk(&format!("<- [{namespace}]\n{} |", body.trim_start()))
+}
+
 pub fn event_to_output_message(event: AgentEvent) -> Option<OutputMessage> {
     match event.stream {
-        EventStreamKind::Stdout => Some(OutputMessage {
-            namespace: event.namespace,
-            body: event.line,
-        }),
+        EventStreamKind::Stdout => Some(OutputMessage::complete(event.namespace, event.line)),
+        EventStreamKind::Delta => Some(OutputMessage::delta(event.namespace, event.line)),
+        EventStreamKind::Final => Some(OutputMessage::final_message(event.namespace, event.line)),
         EventStreamKind::Stderr | EventStreamKind::Status => None,
     }
 }
@@ -233,12 +428,9 @@ mod tests {
     #[tokio::test]
     async fn memory_output_records_messages() {
         let sink = InMemoryOutputSink::default();
-        sink.send(OutputMessage {
-            namespace: "moni".to_string(),
-            body: "hello".to_string(),
-        })
-        .await
-        .unwrap();
+        sink.send(OutputMessage::complete("moni", "hello"))
+            .await
+            .unwrap();
 
         assert_eq!(sink.messages().await.len(), 1);
         assert_eq!(sink.messages().await[0].body, "hello");
@@ -255,6 +447,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.namespace, "moni");
+        assert_eq!(output.body, "hello");
+        assert_eq!(output.kind, OutputMessageKind::Complete);
+    }
+
+    #[test]
+    fn delta_event_becomes_delta_output_message() {
+        let output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Delta,
+            line: "hel".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(output.kind, OutputMessageKind::Delta);
+        assert_eq!(output.body, "hel");
+    }
+
+    #[test]
+    fn final_event_becomes_final_output_message() {
+        let output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Final,
+            line: "hello".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(output.kind, OutputMessageKind::Final);
         assert_eq!(output.body, "hello");
     }
 

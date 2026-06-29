@@ -16,6 +16,7 @@ use crate::app::MoniApp;
 use crate::output::DiscordTypingTracker;
 use crate::queue::{NamespaceQueue, QueuedPrompt};
 use crate::registry::BindingRegistry;
+use crate::voice::{VoiceTranscriber, build_voice_prompt, is_audio_attachment};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelBinding {
@@ -58,6 +59,7 @@ pub struct DiscordBotConfig {
     pub bindings: Vec<ChannelBinding>,
     pub allowed_user_ids: Vec<String>,
     pub default_category_id: Option<ChannelId>,
+    pub voice_transcriber: Option<VoiceTranscriber>,
 }
 
 impl DiscordBotConfig {
@@ -70,6 +72,7 @@ impl DiscordBotConfig {
             bindings,
             allowed_user_ids: Vec::new(),
             default_category_id: None,
+            voice_transcriber: None,
         })
     }
 
@@ -91,6 +94,11 @@ impl DiscordBotConfig {
             .transpose()?;
         Ok(self)
     }
+
+    pub fn with_voice_transcriber(mut self, voice_transcriber: Option<VoiceTranscriber>) -> Self {
+        self.voice_transcriber = voice_transcriber;
+        self
+    }
 }
 
 pub struct MoniDiscordHandler {
@@ -99,6 +107,7 @@ pub struct MoniDiscordHandler {
     allowed_user_ids: HashSet<String>,
     typing: DiscordTypingTracker,
     default_category_id: Option<ChannelId>,
+    voice_transcriber: Option<VoiceTranscriber>,
 }
 
 impl MoniDiscordHandler {
@@ -108,6 +117,7 @@ impl MoniDiscordHandler {
         allowed_user_ids: impl IntoIterator<Item = String>,
         typing: DiscordTypingTracker,
         default_category_id: Option<ChannelId>,
+        voice_transcriber: Option<VoiceTranscriber>,
     ) -> Self {
         Self {
             app,
@@ -115,6 +125,7 @@ impl MoniDiscordHandler {
             allowed_user_ids: allowed_user_ids.into_iter().collect(),
             typing,
             default_category_id,
+            voice_transcriber,
         }
     }
 
@@ -162,6 +173,57 @@ impl MoniDiscordHandler {
             .await?;
         Ok(())
     }
+
+    async fn handle_voice_message(
+        &self,
+        ctx: &Context,
+        message: &Message,
+        binding: &ChannelBinding,
+    ) -> anyhow::Result<bool> {
+        let Some(attachment) = message.attachments.iter().find(|attachment| {
+            is_audio_attachment(&attachment.filename, attachment.content_type.as_deref())
+        }) else {
+            return Ok(false);
+        };
+
+        self.typing
+            .start(binding.namespace.clone(), message.channel_id, &ctx.http)
+            .await;
+
+        let Some(transcriber) = &self.voice_transcriber else {
+            self.typing.stop(&binding.namespace).await;
+            message
+                .channel_id
+                .say(
+                    &ctx.http,
+                    "Voice transcription unavailable - whisper.cpp is not configured",
+                )
+                .await?;
+            return Ok(true);
+        };
+
+        let transcript = transcriber.transcribe_url(&attachment.url).await?;
+        if transcript == "[empty transcription]" {
+            self.typing.stop(&binding.namespace).await;
+            message
+                .channel_id
+                .say(&ctx.http, "Could not transcribe voice message.")
+                .await?;
+            return Ok(true);
+        }
+
+        let caption = message
+            .content
+            .replace(|ch: char| ch == '\n' || ch == '\r', " ");
+        let prompt = build_voice_prompt(&strip_discord_mentions(&caption), &transcript);
+        let inbound = DiscordInboundMessage {
+            channel_id: message.channel_id.to_string(),
+            author_id: message.author.id.to_string(),
+            body: prompt,
+        };
+        self.app.handle_discord_message(binding, inbound).await?;
+        Ok(true)
+    }
 }
 
 #[serenity_async_trait]
@@ -201,7 +263,7 @@ impl EventHandler for MoniDiscordHandler {
         let inbound = DiscordInboundMessage {
             channel_id: message.channel_id.to_string(),
             author_id,
-            body: message.content,
+            body: message.content.clone(),
         };
 
         let Some(binding) = self.registry.get_by_channel(message.channel_id).await else {
@@ -222,6 +284,17 @@ impl EventHandler for MoniDiscordHandler {
             namespace = %binding.namespace,
             "routing Discord message"
         );
+        match self.handle_voice_message(&ctx, &message, &binding).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                self.typing.stop(&binding.namespace).await;
+                let user_message = voice_error_message(&err);
+                let _ = message.channel_id.say(&ctx.http, user_message).await;
+                tracing::error!(channel_id = %binding.channel_id, namespace = %binding.namespace, error = %err, "failed to transcribe discord voice message");
+                return;
+            }
+        }
         self.typing
             .start(binding.namespace.clone(), message.channel_id, &ctx.http)
             .await;
@@ -247,6 +320,7 @@ pub async fn run_discord_bot(
         config.allowed_user_ids,
         typing,
         config.default_category_id,
+        config.voice_transcriber,
     );
     let mut client = Client::builder(config.token, intents)
         .event_handler(handler)
@@ -329,6 +403,35 @@ fn discord_channel_name(namespace: &str) -> String {
         name.to_string()
     } else {
         "moni-channel".to_string()
+    }
+}
+
+fn strip_discord_mentions(text: &str) -> String {
+    text.split_whitespace()
+        .filter(|word| {
+            !(word.starts_with("<@")
+                && word.ends_with('>')
+                && word
+                    .trim_start_matches("<@!")
+                    .trim_start_matches("<@")
+                    .trim_end_matches('>')
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn voice_error_message(err: &anyhow::Error) -> String {
+    let message = err.to_string();
+    if message.contains("whisper-cpp not found") {
+        "Voice transcription unavailable - whisper.cpp is not installed".to_string()
+    } else if message.contains("No whisper model found") {
+        "Voice transcription unavailable - no whisper model found".to_string()
+    } else if message.contains("ffmpeg not found") {
+        "Voice transcription unavailable - ffmpeg is not installed".to_string()
+    } else {
+        format!("Voice transcription failed: {message}")
     }
 }
 
@@ -569,6 +672,7 @@ mod tests {
             allowed_user_ids: HashSet::new(),
             typing: DiscordTypingTracker::default(),
             default_category_id: None,
+            voice_transcriber: None,
         };
 
         assert!(handler.is_authorized("42"));
@@ -595,6 +699,7 @@ mod tests {
             allowed_user_ids: HashSet::from(["42".to_string()]),
             typing: DiscordTypingTracker::default(),
             default_category_id: None,
+            voice_transcriber: None,
         };
 
         assert!(handler.is_authorized("42"));
