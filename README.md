@@ -51,6 +51,34 @@ cargo run
 
 `MONI_CHANNELS` is comma-separated. Each entry is `discord_channel_id=namespace=repo_url`.
 
+## Deployment
+
+`moni` is not published to crates.io yet. The production deployment uses the GitHub
+checkout on the remote machine and builds with Cargo there:
+
+```bash
+./deploy/remote-build-restart.sh
+```
+
+That script runs the clean deploy path on `feral@100.84.38.25`:
+
+```bash
+cd ~/.local/share/moni/current
+git pull --ff-only origin master
+cargo build --release
+launchctl kickstart -k gui/$(id -u)/com.feral.moni
+```
+
+The launchd wrapper executes:
+
+```bash
+~/.local/share/moni/current/target/release/moni
+```
+
+Use crates.io later if `moni` becomes a general-purpose installable crate. For
+this service, the GitHub checkout keeps the deploy tied to the restored
+cc-discord credentials, channel mappings, and launchd wrapper.
+
 Runtime environment:
 
 - `MONI_DISCORD_TOKEN`: Discord bot token.

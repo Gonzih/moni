@@ -30,7 +30,7 @@ export RUST_LOG="moni=info,warn"
 
 export GITKB_DOMAIN="gitkb.com"
 if [ -f "$OLD_GITKB" ]; then
-  GITKB_TOKEN_LINE="$(awk -F= '/^export GITKB_TOKEN=/{print $2; exit}' "$OLD_GITKB")"
+  GITKB_TOKEN_LINE="$(/usr/bin/awk -F= '/^export GITKB_TOKEN=/{print $2; exit}' "$OLD_GITKB")"
   if [ -n "$GITKB_TOKEN_LINE" ]; then
     export GITKB_TOKEN="$GITKB_TOKEN_LINE"
   fi
