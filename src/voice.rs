@@ -206,6 +206,7 @@ fn env_candidates(key: &str, defaults: &[&str]) -> Vec<PathBuf> {
     if let Ok(value) = env::var(key) {
         if !value.trim().is_empty() {
             paths.push(PathBuf::from(value));
+            return paths;
         }
     }
     paths.extend(defaults.iter().map(PathBuf::from));
@@ -303,17 +304,70 @@ fn clean_transcript(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        env, fs,
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        sync::Mutex,
+    };
 
     use tempfile::TempDir;
 
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn write_script(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn voice_env_snapshot() -> [(&'static str, Option<String>); 6] {
+        [
+            ("WHISPER_BIN", env::var("WHISPER_BIN").ok()),
+            ("FFMPEG_BIN", env::var("FFMPEG_BIN").ok()),
+            ("CURL_BIN", env::var("CURL_BIN").ok()),
+            ("WHISPER_MODEL", env::var("WHISPER_MODEL").ok()),
+            ("WHISPER_MODEL_DIR", env::var("WHISPER_MODEL_DIR").ok()),
+            ("HOME", env::var("HOME").ok()),
+        ]
+    }
+
+    fn restore_voice_env(old: [(&'static str, Option<String>); 6]) {
+        unsafe {
+            for (key, value) in old {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    fn restore_test_env(key: &str, value: Option<String>) {
+        unsafe {
+            if let Some(value) = value {
+                env::set_var(key, value);
+            } else {
+                env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn restore_test_env_sets_and_removes_values() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let original = env::var("MONI_TEST_RESTORE").ok();
+
+        restore_test_env("MONI_TEST_RESTORE", Some("value".to_string()));
+        assert_eq!(env::var("MONI_TEST_RESTORE").unwrap(), "value");
+
+        restore_test_env("MONI_TEST_RESTORE", None);
+        assert!(env::var("MONI_TEST_RESTORE").is_err());
+
+        restore_test_env("MONI_TEST_RESTORE", original);
     }
 
     #[test]
@@ -334,6 +388,324 @@ mod tests {
     #[test]
     fn clean_transcript_removes_bracketed_noise() {
         assert_eq!(clean_transcript("[music] hello [BLANK_AUDIO]"), "hello");
+    }
+
+    #[test]
+    fn voice_prompt_omits_empty_caption() {
+        assert_eq!(
+            build_voice_prompt("  ", "hello"),
+            "[voice note - transcription may contain typos]: hello"
+        );
+    }
+
+    #[test]
+    fn model_discovery_accepts_file_named_model() {
+        let dir = TempDir::new().unwrap();
+        let model = dir.path().join("custom.bin");
+        fs::write(&model, "model").unwrap();
+
+        assert_eq!(find_model(vec![model.clone()]), Some(model));
+    }
+
+    #[test]
+    fn model_discovery_prefers_known_names_in_directory() {
+        let dir = TempDir::new().unwrap();
+        let model = dir.path().join("ggml-base.en.bin");
+        fs::write(&model, "model").unwrap();
+
+        assert_eq!(find_model(vec![dir.path().to_path_buf()]), Some(model));
+    }
+
+    #[test]
+    fn model_discovery_accepts_any_ggml_bin_in_directory() {
+        let dir = TempDir::new().unwrap();
+        let model = dir.path().join("ggml-custom.bin");
+        fs::write(&model, "model").unwrap();
+
+        assert_eq!(find_model(vec![dir.path().to_path_buf()]), Some(model));
+    }
+
+    #[test]
+    fn model_discovery_ignores_non_model_files_in_directory() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("notes.txt"), "not a model").unwrap();
+
+        assert!(find_model(vec![dir.path().to_path_buf()]).is_none());
+    }
+
+    #[test]
+    fn model_discovery_ignores_unreadable_directories() {
+        let dir = TempDir::new().unwrap();
+        let model_dir = dir.path().join("models");
+        fs::create_dir_all(&model_dir).unwrap();
+        let mut permissions = fs::metadata(&model_dir).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&model_dir, permissions).unwrap();
+
+        let found = find_model(vec![model_dir.clone()]);
+
+        let mut permissions = fs::metadata(&model_dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&model_dir, permissions).unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn model_discovery_ignores_existing_non_file_non_directory_paths() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("model.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        assert!(find_model(vec![socket]).is_none());
+    }
+
+    #[test]
+    fn model_discovery_returns_none_for_missing_paths() {
+        assert!(find_model(vec![PathBuf::from("/definitely/missing/model")]).is_none());
+    }
+
+    #[test]
+    fn env_candidates_ignores_blank_env_value() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let original = env::var("MONI_TEST_BLANK").ok();
+        unsafe {
+            env::set_var("MONI_TEST_BLANK", " ");
+        }
+
+        let candidates = env_candidates("MONI_TEST_BLANK", &["fallback"]);
+
+        restore_test_env("MONI_TEST_BLANK", original);
+        assert_eq!(candidates, vec![PathBuf::from("fallback")]);
+    }
+
+    #[test]
+    fn audio_extension_is_detected_from_url() {
+        assert_eq!(audio_extension_from_url("https://cdn/x.m4a?token=1"), "m4a");
+        assert_eq!(audio_extension_from_url("https://cdn/no-extension"), "ogg");
+    }
+
+    #[test]
+    fn missing_command_reports_spawn_error() {
+        let err = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_command(
+                Path::new("/definitely/missing/moni-voice-command"),
+                &[],
+                Duration::from_secs(5),
+            ))
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn failed_command_reports_stderr() {
+        let dir = TempDir::new().unwrap();
+        let fail = dir.path().join("fail");
+        write_script(
+            &fail,
+            r#"#!/bin/sh
+echo nope >&2
+exit 7
+"#,
+        );
+
+        let err = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_command(&fail, &[], Duration::from_secs(5)))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn timed_out_command_reports_timeout() {
+        let dir = TempDir::new().unwrap();
+        let slow = dir.path().join("slow");
+        write_script(
+            &slow,
+            r#"#!/bin/sh
+sleep 2
+"#,
+        );
+
+        let err = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(run_command(&slow, &[], Duration::from_millis(10)))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn from_env_uses_configured_paths() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let curl = dir.path().join("curl");
+        let model_dir = dir.path().join("models");
+        fs::create_dir_all(&model_dir).unwrap();
+        let model = model_dir.join("ggml-small.en.bin");
+        for bin in [&whisper, &ffmpeg, &curl] {
+            write_script(bin, "#!/bin/sh\nexit 0\n");
+        }
+        fs::write(&model, "model").unwrap();
+
+        let old = [
+            ("WHISPER_BIN", env::var("WHISPER_BIN").ok()),
+            ("FFMPEG_BIN", env::var("FFMPEG_BIN").ok()),
+            ("CURL_BIN", env::var("CURL_BIN").ok()),
+            ("WHISPER_MODEL", env::var("WHISPER_MODEL").ok()),
+            ("WHISPER_MODEL_DIR", env::var("WHISPER_MODEL_DIR").ok()),
+            ("HOME", env::var("HOME").ok()),
+        ];
+        unsafe {
+            env::set_var("WHISPER_BIN", &whisper);
+            env::set_var("FFMPEG_BIN", &ffmpeg);
+            env::set_var("CURL_BIN", &curl);
+            env::remove_var("WHISPER_MODEL");
+            env::set_var("WHISPER_MODEL_DIR", &model_dir);
+            env::set_var("HOME", dir.path());
+        }
+
+        let transcriber = VoiceTranscriber::from_env().unwrap();
+        assert_eq!(transcriber.whisper_bin, whisper);
+        assert_eq!(transcriber.ffmpeg_bin, ffmpeg);
+        assert_eq!(transcriber.curl_bin, curl);
+        assert_eq!(transcriber.model, model);
+
+        unsafe {
+            for (key, value) in old {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_reports_missing_model() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let curl = dir.path().join("curl");
+        let empty_model_dir = dir.path().join("models");
+        fs::create_dir_all(&empty_model_dir).unwrap();
+        for bin in [&whisper, &ffmpeg, &curl] {
+            write_script(bin, "#!/bin/sh\nexit 0\n");
+        }
+
+        let old = [
+            ("WHISPER_BIN", env::var("WHISPER_BIN").ok()),
+            ("FFMPEG_BIN", env::var("FFMPEG_BIN").ok()),
+            ("CURL_BIN", env::var("CURL_BIN").ok()),
+            ("WHISPER_MODEL", env::var("WHISPER_MODEL").ok()),
+            ("WHISPER_MODEL_DIR", env::var("WHISPER_MODEL_DIR").ok()),
+            ("HOME", env::var("HOME").ok()),
+        ];
+        unsafe {
+            env::set_var("WHISPER_BIN", &whisper);
+            env::set_var("FFMPEG_BIN", &ffmpeg);
+            env::set_var("CURL_BIN", &curl);
+            env::remove_var("WHISPER_MODEL");
+            env::set_var("WHISPER_MODEL_DIR", &empty_model_dir);
+            env::set_var("HOME", dir.path());
+        }
+
+        let err = VoiceTranscriber::from_env().unwrap_err();
+        assert!(err.to_string().contains("No whisper model found"));
+
+        unsafe {
+            for (key, value) in old {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_env_reports_missing_ffmpeg() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let curl = dir.path().join("curl");
+        let model = dir.path().join("ggml-small.en.bin");
+        write_script(&whisper, "#!/bin/sh\nexit 0\n");
+        write_script(&curl, "#!/bin/sh\nexit 0\n");
+        fs::write(&model, "model").unwrap();
+        let old = voice_env_snapshot();
+        unsafe {
+            env::set_var("WHISPER_BIN", &whisper);
+            env::set_var("FFMPEG_BIN", dir.path().join("missing-ffmpeg"));
+            env::set_var("CURL_BIN", &curl);
+            env::set_var("WHISPER_MODEL", &model);
+            env::remove_var("WHISPER_MODEL_DIR");
+        }
+
+        let err = VoiceTranscriber::from_env().unwrap_err();
+
+        restore_voice_env(old);
+        assert!(err.to_string().contains("ffmpeg not found"));
+    }
+
+    #[test]
+    fn from_env_reports_missing_curl() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let model = dir.path().join("ggml-small.en.bin");
+        write_script(&whisper, "#!/bin/sh\nexit 0\n");
+        write_script(&ffmpeg, "#!/bin/sh\nexit 0\n");
+        fs::write(&model, "model").unwrap();
+        let old = voice_env_snapshot();
+        unsafe {
+            env::set_var("WHISPER_BIN", &whisper);
+            env::set_var("FFMPEG_BIN", &ffmpeg);
+            env::set_var("CURL_BIN", dir.path().join("missing-curl"));
+            env::set_var("WHISPER_MODEL", &model);
+            env::remove_var("WHISPER_MODEL_DIR");
+        }
+
+        let err = VoiceTranscriber::from_env().unwrap_err();
+
+        restore_voice_env(old);
+        assert!(err.to_string().contains("curl not found"));
+    }
+
+    #[test]
+    fn from_env_accepts_explicit_model_without_home() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let curl = dir.path().join("curl");
+        let model = dir.path().join("ggml-small.en.bin");
+        for bin in [&whisper, &ffmpeg, &curl] {
+            write_script(bin, "#!/bin/sh\nexit 0\n");
+        }
+        fs::write(&model, "model").unwrap();
+        let old = voice_env_snapshot();
+        unsafe {
+            env::set_var("WHISPER_BIN", &whisper);
+            env::set_var("FFMPEG_BIN", &ffmpeg);
+            env::set_var("CURL_BIN", &curl);
+            env::set_var("WHISPER_MODEL", &model);
+            env::remove_var("WHISPER_MODEL_DIR");
+            env::remove_var("HOME");
+        }
+
+        let transcriber = VoiceTranscriber::from_env().unwrap();
+
+        restore_voice_env(old);
+        assert_eq!(transcriber.model, model);
     }
 
     #[tokio::test]
@@ -379,5 +751,176 @@ printf "hello from voice" > "$wav.txt"
             .unwrap();
 
         assert_eq!(transcript, "hello from voice");
+    }
+
+    #[tokio::test]
+    async fn transcriber_returns_empty_marker_for_blank_output() {
+        let dir = TempDir::new().unwrap();
+        let curl = dir.path().join("curl");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let whisper = dir.path().join("whisper-cli");
+        let model = dir.path().join("ggml-small.bin");
+        fs::write(&model, "model").unwrap();
+        write_script(
+            &curl,
+            "#!/bin/sh\nwhile [ \"$1\" != \"-o\" ]; do shift; done\nshift\nprintf audio > \"$1\"\n",
+        );
+        write_script(
+            &ffmpeg,
+            "#!/bin/sh\nout=\"\"\nfor arg in \"$@\"; do out=\"$arg\"; done\nprintf wav > \"$out\"\n",
+        );
+        write_script(
+            &whisper,
+            "#!/bin/sh\nwhile [ \"$1\" != \"-f\" ]; do shift; done\nshift\nprintf \"[BLANK_AUDIO]\" > \"$1.txt\"\n",
+        );
+
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path());
+
+        assert_eq!(
+            transcriber
+                .transcribe_url("https://cdn.discordapp.com/voice.webm")
+                .await
+                .unwrap(),
+            "[empty transcription]"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcriber_cleans_up_after_download_failure() {
+        let dir = TempDir::new().unwrap();
+        let curl = dir.path().join("curl");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let whisper = dir.path().join("whisper-cli");
+        let model = dir.path().join("ggml-small.en.bin");
+        fs::write(&model, "model").unwrap();
+        write_script(&curl, "#!/bin/sh\necho download failed >&2\nexit 2\n");
+        write_script(&ffmpeg, "#!/bin/sh\nexit 0\n");
+        write_script(&whisper, "#!/bin/sh\nexit 0\n");
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path());
+
+        let err = transcriber
+            .transcribe_url("https://cdn.discordapp.com/voice.mp3")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("audio download failed"));
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("moni-voice-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn transcriber_reports_ffmpeg_failure() {
+        let dir = TempDir::new().unwrap();
+        let curl = dir.path().join("curl");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let whisper = dir.path().join("whisper-cli");
+        let model = dir.path().join("ggml-small.en.bin");
+        fs::write(&model, "model").unwrap();
+        write_script(
+            &curl,
+            "#!/bin/sh\nwhile [ \"$1\" != \"-o\" ]; do shift; done\nshift\nprintf audio > \"$1\"\n",
+        );
+        write_script(&ffmpeg, "#!/bin/sh\necho bad ffmpeg >&2\nexit 2\n");
+        write_script(&whisper, "#!/bin/sh\nexit 0\n");
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path());
+
+        let err = transcriber
+            .transcribe_url("https://cdn.discordapp.com/voice.ogg")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("ffmpeg conversion failed"));
+    }
+
+    #[tokio::test]
+    async fn transcriber_reports_whisper_failure() {
+        let dir = TempDir::new().unwrap();
+        let curl = dir.path().join("curl");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let whisper = dir.path().join("whisper-cli");
+        let model = dir.path().join("ggml-small.en.bin");
+        fs::write(&model, "model").unwrap();
+        write_script(
+            &curl,
+            "#!/bin/sh\nwhile [ \"$1\" != \"-o\" ]; do shift; done\nshift\nprintf audio > \"$1\"\n",
+        );
+        write_script(
+            &ffmpeg,
+            "#!/bin/sh\nout=\"\"\nfor arg in \"$@\"; do out=\"$arg\"; done\nprintf wav > \"$out\"\n",
+        );
+        write_script(&whisper, "#!/bin/sh\necho bad whisper >&2\nexit 3\n");
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path());
+
+        let err = transcriber
+            .transcribe_url("https://cdn.discordapp.com/voice.ogg")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("whisper-cpp failed"));
+    }
+
+    #[tokio::test]
+    async fn transcriber_reports_temp_dir_creation_error() {
+        let dir = TempDir::new().unwrap();
+        let temp_file = dir.path().join("not-a-directory");
+        fs::write(&temp_file, "file").unwrap();
+        let transcriber = VoiceTranscriber::new(
+            dir.path().join("whisper"),
+            dir.path().join("ffmpeg"),
+            dir.path().join("curl"),
+            dir.path().join("ggml-small.en.bin"),
+            temp_file,
+        );
+
+        let err = transcriber
+            .transcribe_url("https://cdn.discordapp.com/voice.ogg")
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn read_whisper_text_reports_existing_unreadable_output() {
+        let dir = TempDir::new().unwrap();
+        let wav_path = dir.path().join("voice.wav");
+        let output_path = PathBuf::from(format!("{}.txt", wav_path.to_string_lossy()));
+        fs::create_dir(&output_path).unwrap();
+
+        let err = read_whisper_text(&wav_path).unwrap_err();
+
+        assert!(err.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[tokio::test]
+    async fn transcriber_reports_missing_whisper_output() {
+        let dir = TempDir::new().unwrap();
+        let curl = dir.path().join("curl");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let whisper = dir.path().join("whisper-cli");
+        let model = dir.path().join("ggml-small.en.bin");
+        fs::write(&model, "model").unwrap();
+        write_script(
+            &curl,
+            "#!/bin/sh\nwhile [ \"$1\" != \"-o\" ]; do shift; done\nshift\nprintf audio > \"$1\"\n",
+        );
+        write_script(
+            &ffmpeg,
+            "#!/bin/sh\nout=\"\"\nfor arg in \"$@\"; do out=\"$arg\"; done\nprintf wav > \"$out\"\n",
+        );
+        write_script(&whisper, "#!/bin/sh\nexit 0\n");
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path());
+
+        let err = transcriber
+            .transcribe_url("https://cdn.discordapp.com/voice.ogg")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("produced no output text file"));
     }
 }

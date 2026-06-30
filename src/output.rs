@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serenity::{
     builder::{CreateMessage, EditMessage},
     http::{Http, Typing},
-    model::{channel::Message, id::ChannelId},
+    model::id::{ChannelId, MessageId},
 };
 use tokio::{
     sync::Mutex,
@@ -116,7 +116,7 @@ impl OutputSink for InMemoryOutputSink {
 
 #[derive(Clone)]
 pub struct DiscordOutputSink {
-    http: Arc<Http>,
+    transport: Arc<dyn DiscordTransport>,
     registry: BindingRegistry,
     typing: Option<DiscordTypingTracker>,
     live: Arc<Mutex<DiscordLiveMessages>>,
@@ -142,8 +142,12 @@ impl DiscordOutputSink {
     }
 
     pub fn with_registry(token: impl AsRef<str>, registry: BindingRegistry) -> Self {
+        Self::with_transport(registry, Arc::new(SerenityDiscordTransport::new(token)))
+    }
+
+    fn with_transport(registry: BindingRegistry, transport: Arc<dyn DiscordTransport>) -> Self {
         Self {
-            http: Arc::new(Http::new(token.as_ref())),
+            transport,
             registry,
             typing: None,
             live: Arc::new(Mutex::new(DiscordLiveMessages::default())),
@@ -172,7 +176,7 @@ impl OutputSink for DiscordOutputSink {
             OutputMessageKind::Delta => {
                 let mut live = self.live.lock().await;
                 live.apply_delta(
-                    &self.http,
+                    self.transport.as_ref(),
                     channel_id,
                     &message.namespace,
                     &message.body,
@@ -187,7 +191,12 @@ impl OutputSink for DiscordOutputSink {
                 }
                 let mut live = self.live.lock().await;
                 if live
-                    .finalize(&self.http, channel_id, &message.namespace, &message.body)
+                    .finalize(
+                        self.transport.as_ref(),
+                        channel_id,
+                        &message.namespace,
+                        &message.body,
+                    )
                     .await?
                 {
                     return Ok(());
@@ -201,9 +210,72 @@ impl OutputSink for DiscordOutputSink {
         }
 
         for chunk in split_discord_message(&message.body) {
-            send_discord_chunk(&self.http, channel_id, &chunk).await?;
+            send_discord_chunk(self.transport.as_ref(), channel_id, &chunk).await?;
         }
 
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscordMessageRef {
+    channel_id: ChannelId,
+    message_id: MessageId,
+}
+
+#[async_trait]
+trait DiscordTransport: Send + Sync {
+    async fn send_message(
+        &self,
+        channel_id: ChannelId,
+        content: &str,
+    ) -> anyhow::Result<DiscordMessageRef>;
+
+    async fn edit_message(&self, message: DiscordMessageRef, content: &str) -> anyhow::Result<()>;
+}
+
+struct SerenityDiscordTransport {
+    http: Arc<Http>,
+}
+
+impl SerenityDiscordTransport {
+    fn new(token: impl AsRef<str>) -> Self {
+        Self {
+            http: Arc::new(Http::new(token.as_ref())),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_http(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl DiscordTransport for SerenityDiscordTransport {
+    async fn send_message(
+        &self,
+        channel_id: ChannelId,
+        content: &str,
+    ) -> anyhow::Result<DiscordMessageRef> {
+        let message = channel_id
+            .send_message(&self.http, CreateMessage::new().content(content))
+            .await?;
+        Ok(DiscordMessageRef {
+            channel_id,
+            message_id: message.id,
+        })
+    }
+
+    async fn edit_message(&self, message: DiscordMessageRef, content: &str) -> anyhow::Result<()> {
+        message
+            .channel_id
+            .edit_message(
+                &self.http,
+                message.message_id,
+                EditMessage::new().content(content),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -215,14 +287,14 @@ struct DiscordLiveMessages {
 }
 
 struct DiscordLiveMessage {
-    message: Message,
+    message: DiscordMessageRef,
     text: String,
 }
 
 impl DiscordLiveMessages {
     async fn apply_delta(
         &mut self,
-        http: &Arc<Http>,
+        transport: &dyn DiscordTransport,
         channel_id: ChannelId,
         namespace: &str,
         delta: &str,
@@ -235,9 +307,7 @@ impl DiscordLiveMessages {
             if let Some(typing) = typing {
                 typing.stop(namespace).await;
             }
-            let message = channel_id
-                .send_message(http, CreateMessage::new().content("..."))
-                .await?;
+            let message = transport.send_message(channel_id, "...").await?;
             self.messages.insert(
                 namespace.to_string(),
                 DiscordLiveMessage {
@@ -258,25 +328,25 @@ impl DiscordLiveMessages {
             return Ok(());
         }
         let content = live_display(namespace, &entry.text);
-        edit_discord_message(http, &mut entry.message, &content).await?;
+        edit_discord_message(transport, entry.message, &content).await?;
         self.next_edit_at = Some(Instant::now() + LIVE_EDIT_MIN_INTERVAL);
         Ok(())
     }
 
     async fn finalize(
         &mut self,
-        http: &Arc<Http>,
+        transport: &dyn DiscordTransport,
         channel_id: ChannelId,
         namespace: &str,
         body: &str,
     ) -> anyhow::Result<bool> {
-        let Some(mut entry) = self.messages.remove(namespace) else {
+        let Some(entry) = self.messages.remove(namespace) else {
             return Ok(false);
         };
         let chunks = split_discord_message(body);
-        edit_discord_message(http, &mut entry.message, &chunks[0]).await?;
+        edit_discord_message(transport, entry.message, &chunks[0]).await?;
         for chunk in chunks.iter().skip(1) {
-            send_discord_chunk(http, channel_id, chunk).await?;
+            send_discord_chunk(transport, channel_id, chunk).await?;
         }
         Ok(true)
     }
@@ -289,15 +359,15 @@ impl DiscordLiveMessages {
 }
 
 async fn edit_discord_message(
-    http: &Arc<Http>,
-    message: &mut Message,
+    transport: &dyn DiscordTransport,
+    message: DiscordMessageRef,
     body: &str,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(500);
-    let mut last_error = None;
+    let mut last_error = "unknown error".to_string();
     for attempt in 1..=DISCORD_SEND_ATTEMPTS {
-        match message
-            .edit(http, EditMessage::new().content(first_discord_chunk(body)))
+        match transport
+            .edit_message(message, &first_discord_chunk(body))
             .await
         {
             Ok(()) => return Ok(()),
@@ -308,7 +378,7 @@ async fn edit_discord_message(
                     error = %err,
                     "failed to edit Discord live output"
                 );
-                last_error = Some(err);
+                last_error = err.to_string();
                 if attempt < DISCORD_SEND_ATTEMPTS {
                     sleep(delay).await;
                     delay *= 2;
@@ -319,21 +389,19 @@ async fn edit_discord_message(
     Err(anyhow::anyhow!(
         "failed to edit Discord output after {DISCORD_SEND_ATTEMPTS} attempts: {}",
         last_error
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
     ))
 }
 
 async fn send_discord_chunk(
-    http: &Arc<Http>,
+    transport: &dyn DiscordTransport,
     channel_id: ChannelId,
     chunk: &str,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_millis(500);
-    let mut last_error = None;
+    let mut last_error = "unknown error".to_string();
 
     for attempt in 1..=DISCORD_SEND_ATTEMPTS {
-        match channel_id.say(http, chunk).await {
+        match transport.send_message(channel_id, chunk).await {
             Ok(_) => return Ok(()),
             Err(err) => {
                 tracing::warn!(
@@ -342,7 +410,7 @@ async fn send_discord_chunk(
                     error = %err,
                     "failed to send Discord output chunk"
                 );
-                last_error = Some(err);
+                last_error = err.to_string();
                 if attempt < DISCORD_SEND_ATTEMPTS {
                     sleep(delay).await;
                     delay *= 2;
@@ -354,8 +422,6 @@ async fn send_discord_chunk(
     Err(anyhow::anyhow!(
         "failed to send Discord output after {DISCORD_SEND_ATTEMPTS} attempts: {}",
         last_error
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
     ))
 }
 
@@ -392,10 +458,7 @@ pub fn split_discord_message(body: &str) -> Vec<String> {
         }
     }
 
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-
+    chunks.push(current);
     chunks
 }
 
@@ -403,7 +466,7 @@ fn first_discord_chunk(body: &str) -> String {
     split_discord_message(body)
         .into_iter()
         .next()
-        .unwrap_or_else(|| " ".to_string())
+        .expect("split_discord_message always returns at least one chunk")
 }
 
 fn live_display(namespace: &str, body: &str) -> String {
@@ -422,8 +485,90 @@ pub fn event_to_output_message(event: AgentEvent) -> Option<OutputMessage> {
 #[cfg(test)]
 mod tests {
     use crate::engine::AgentEngine;
+    use crate::test_support::DiscordHttpProxy;
+    use serenity::http::HttpBuilder;
 
     use super::*;
+
+    #[derive(Default)]
+    struct FakeDiscordTransport {
+        state: tokio::sync::Mutex<FakeDiscordState>,
+    }
+
+    #[derive(Default, Clone)]
+    struct FakeDiscordState {
+        next_message_id: u64,
+        sends: Vec<(ChannelId, String)>,
+        edits: Vec<(DiscordMessageRef, String)>,
+        fail_sends: usize,
+        fail_edits: usize,
+    }
+
+    impl FakeDiscordTransport {
+        async fn sends(&self) -> Vec<(ChannelId, String)> {
+            self.state.lock().await.sends.clone()
+        }
+
+        async fn edits(&self) -> Vec<(DiscordMessageRef, String)> {
+            self.state.lock().await.edits.clone()
+        }
+
+        async fn fail_next_sends(&self, count: usize) {
+            self.state.lock().await.fail_sends = count;
+        }
+
+        async fn fail_next_edits(&self, count: usize) {
+            self.state.lock().await.fail_edits = count;
+        }
+    }
+
+    #[async_trait]
+    impl DiscordTransport for FakeDiscordTransport {
+        async fn send_message(
+            &self,
+            channel_id: ChannelId,
+            content: &str,
+        ) -> anyhow::Result<DiscordMessageRef> {
+            let mut state = self.state.lock().await;
+            if state.fail_sends > 0 {
+                state.fail_sends -= 1;
+                anyhow::bail!("send failed");
+            }
+            state.next_message_id += 1;
+            state.sends.push((channel_id, content.to_string()));
+            Ok(DiscordMessageRef {
+                channel_id,
+                message_id: MessageId::new(state.next_message_id),
+            })
+        }
+
+        async fn edit_message(
+            &self,
+            message: DiscordMessageRef,
+            content: &str,
+        ) -> anyhow::Result<()> {
+            let mut state = self.state.lock().await;
+            if state.fail_edits > 0 {
+                state.fail_edits -= 1;
+                anyhow::bail!("edit failed");
+            }
+            state.edits.push((message, content.to_string()));
+            Ok(())
+        }
+    }
+
+    fn registry() -> BindingRegistry {
+        BindingRegistry::new([crate::discord::ChannelBinding {
+            channel_id: "123".to_string(),
+            namespace: "moni".to_string(),
+            repo_url: "https://github.com/Gonzih/moni".to_string(),
+        }])
+        .unwrap()
+    }
+
+    fn output_with_transport(transport: Arc<FakeDiscordTransport>) -> DiscordOutputSink {
+        DiscordOutputSink::with_transport(registry(), transport)
+    }
 
     #[tokio::test]
     async fn memory_output_records_messages() {
@@ -434,6 +579,348 @@ mod tests {
 
         assert_eq!(sink.messages().await.len(), 1);
         assert_eq!(sink.messages().await[0].body, "hello");
+    }
+
+    #[tokio::test]
+    async fn discord_output_new_maps_bindings_and_ignores_unbound_namespace() {
+        let sink = DiscordOutputSink::new("token", [("moni".to_string(), ChannelId::new(123))])
+            .with_typing_tracker(DiscordTypingTracker::default());
+
+        sink.send(OutputMessage::complete("missing", "hello"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serenity_discord_transport_sends_and_edits_through_http_proxy() {
+        let proxy = DiscordHttpProxy::start();
+        let http = Arc::new(
+            HttpBuilder::new("token")
+                .proxy(proxy.base_url())
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let transport = SerenityDiscordTransport::with_http(http);
+
+        let message = transport
+            .send_message(ChannelId::new(123), "hello proxy")
+            .await
+            .unwrap();
+        transport
+            .edit_message(message, "edited proxy")
+            .await
+            .unwrap();
+
+        let requests = proxy.requests();
+        assert!(requests.iter().any(|request| request.method == "POST"
+            && request.path.contains("/channels/123/messages")
+            && request.body.contains("hello proxy")));
+        assert!(requests.iter().any(|request| request.method == "PATCH"
+            && request.path.contains("/channels/123/messages/111")
+            && request.body.contains("edited proxy")));
+        assert_eq!(message.message_id, MessageId::new(111));
+    }
+
+    #[tokio::test]
+    async fn discord_typing_tracker_starts_replaces_and_stops_typing() {
+        let proxy = DiscordHttpProxy::start();
+        let http = Arc::new(
+            HttpBuilder::new("token")
+                .proxy(proxy.base_url())
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let tracker = DiscordTypingTracker::default();
+
+        tracker.start("moni", ChannelId::new(123), &http).await;
+        proxy.wait_for_path("/channels/123/typing").await;
+        tracker.start("moni", ChannelId::new(123), &http).await;
+        tracker.stop("moni").await;
+
+        assert!(tracker.active.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discord_typing_tracker_expires_after_timeout() {
+        let proxy = DiscordHttpProxy::start();
+        let http = Arc::new(
+            HttpBuilder::new("token")
+                .proxy(proxy.base_url())
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let tracker = DiscordTypingTracker::default();
+
+        tracker.start("moni", ChannelId::new(123), &http).await;
+        assert!(tracker.active.lock().await.contains_key("moni"));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(15 * 60)).await;
+        tokio::task::yield_now().await;
+
+        assert!(tracker.active.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_output_sends_complete_messages_in_chunks() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+        let body = format!(
+            "{}\n{}",
+            "a".repeat(100),
+            "b".repeat(DISCORD_MESSAGE_LIMIT + 5)
+        );
+
+        sink.send(OutputMessage::complete("moni", body.clone()))
+            .await
+            .unwrap();
+
+        let sends = transport.sends().await;
+        assert_eq!(sends.len(), 3);
+        assert!(
+            sends
+                .iter()
+                .all(|(_, chunk)| chunk.len() <= DISCORD_MESSAGE_LIMIT)
+        );
+        assert_eq!(
+            sends
+                .into_iter()
+                .map(|(_, chunk)| chunk)
+                .collect::<Vec<_>>()
+                .join(""),
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_output_edits_live_message_and_finalizes_stream() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+
+        sink.send(OutputMessage::delta("moni", "hel"))
+            .await
+            .unwrap();
+        sink.live.lock().await.next_edit_at = Some(Instant::now() - Duration::from_millis(1));
+        sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
+        sink.send(OutputMessage::final_message("moni", "hello final"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.sends().await,
+            vec![(ChannelId::new(123), "...".to_string())]
+        );
+        let edits = transport.edits().await;
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].1, "<- [moni]\nhello |");
+        assert_eq!(edits[1].1, "hello final");
+    }
+
+    #[tokio::test]
+    async fn discord_output_ignores_empty_delta() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+
+        sink.send(OutputMessage::delta("moni", "")).await.unwrap();
+
+        assert!(transport.sends().await.is_empty());
+        assert!(transport.edits().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_output_stops_typing_when_live_message_starts() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone())
+            .with_typing_tracker(DiscordTypingTracker::default());
+
+        sink.send(OutputMessage::delta("moni", "hello"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.sends().await,
+            vec![(ChannelId::new(123), "...".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_output_reports_live_placeholder_send_error() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        transport.fail_next_sends(1).await;
+        let sink = output_with_transport(transport);
+
+        let err = sink
+            .send(OutputMessage::delta("moni", "hello"))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("send failed"));
+    }
+
+    #[tokio::test]
+    async fn discord_output_reports_live_edit_error() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+
+        sink.send(OutputMessage::delta("moni", "hel"))
+            .await
+            .unwrap();
+        sink.live.lock().await.next_edit_at = Some(Instant::now() - Duration::from_millis(1));
+        transport.fail_next_edits(DISCORD_SEND_ATTEMPTS).await;
+        let err = sink
+            .send(OutputMessage::delta("moni", "lo"))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to edit Discord output"));
+    }
+
+    #[tokio::test]
+    async fn discord_output_finalizes_live_message_with_followup_chunks() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+        let final_body = "f".repeat(DISCORD_MESSAGE_LIMIT + 1);
+
+        sink.send(OutputMessage::delta("moni", "pending"))
+            .await
+            .unwrap();
+        sink.send(OutputMessage::final_message("moni", final_body.clone()))
+            .await
+            .unwrap();
+
+        let edits = transport.edits().await;
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].1.len(), DISCORD_MESSAGE_LIMIT);
+        let sends = transport.sends().await;
+        assert_eq!(sends.len(), 2);
+        assert_eq!(format!("{}{}", edits[0].1, sends[1].1), final_body);
+    }
+
+    #[tokio::test]
+    async fn discord_output_reports_finalize_edit_error() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+
+        sink.send(OutputMessage::delta("moni", "pending"))
+            .await
+            .unwrap();
+        transport.fail_next_edits(DISCORD_SEND_ATTEMPTS).await;
+        let err = sink
+            .send(OutputMessage::final_message("moni", "final"))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to edit Discord output"));
+    }
+
+    #[tokio::test]
+    async fn discord_output_reports_finalize_followup_send_error() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+        let final_body = "f".repeat(DISCORD_MESSAGE_LIMIT + 1);
+
+        sink.send(OutputMessage::delta("moni", "pending"))
+            .await
+            .unwrap();
+        transport.fail_next_sends(DISCORD_SEND_ATTEMPTS).await;
+        let err = sink
+            .send(OutputMessage::final_message("moni", final_body))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to send Discord output"));
+    }
+
+    #[tokio::test]
+    async fn discord_output_final_without_live_message_sends_complete_message() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+
+        sink.send(OutputMessage::final_message("moni", "final body"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.sends().await,
+            vec![(ChannelId::new(123), "final body".to_string())]
+        );
+        assert!(transport.edits().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_output_with_registry_ignores_unbound_delta_and_final() {
+        let sink =
+            DiscordOutputSink::with_registry("token", BindingRegistry::new(Vec::new()).unwrap());
+
+        sink.send(OutputMessage::delta("moni", "hel"))
+            .await
+            .unwrap();
+        sink.send(OutputMessage::final_message("moni", "hello"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discord_send_chunk_retries_then_succeeds() {
+        let transport = FakeDiscordTransport::default();
+        transport.fail_next_sends(2).await;
+
+        send_discord_chunk(&transport, ChannelId::new(123), "hello")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.sends().await,
+            vec![(ChannelId::new(123), "hello".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_send_chunk_reports_retry_exhaustion() {
+        let transport = FakeDiscordTransport::default();
+        transport.fail_next_sends(DISCORD_SEND_ATTEMPTS).await;
+
+        let err = send_discord_chunk(&transport, ChannelId::new(123), "hello")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to send Discord output"));
+        assert!(err.to_string().contains("send failed"));
+    }
+
+    #[tokio::test]
+    async fn discord_edit_message_retries_then_succeeds() {
+        let transport = FakeDiscordTransport::default();
+        let message = transport
+            .send_message(ChannelId::new(123), "placeholder")
+            .await
+            .unwrap();
+        transport.fail_next_edits(2).await;
+
+        edit_discord_message(&transport, message, "edited")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.edits().await,
+            vec![(message, "edited".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_edit_message_reports_retry_exhaustion() {
+        let transport = FakeDiscordTransport::default();
+        let message = transport
+            .send_message(ChannelId::new(123), "placeholder")
+            .await
+            .unwrap();
+        transport.fail_next_edits(DISCORD_SEND_ATTEMPTS).await;
+
+        let err = edit_discord_message(&transport, message, "edited")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("failed to edit Discord output"));
+        assert!(err.to_string().contains("edit failed"));
     }
 
     #[test]
@@ -528,5 +1015,52 @@ mod tests {
     #[test]
     fn split_discord_message_maps_empty_body_to_sendable_content() {
         assert_eq!(split_discord_message(""), vec![" ".to_string()]);
+    }
+
+    #[test]
+    fn split_discord_message_splits_long_line_after_existing_chunk() {
+        let body = format!(
+            "{}\n{}",
+            "a".repeat(100),
+            "b".repeat(DISCORD_MESSAGE_LIMIT + 5)
+        );
+        let chunks = split_discord_message(&body);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.join(""), body);
+    }
+
+    #[test]
+    fn split_discord_message_starts_new_chunk_for_short_overflowing_line() {
+        let body = format!("{}\nsmall", "a".repeat(DISCORD_MESSAGE_LIMIT - 1));
+        let chunks = split_discord_message(&body);
+
+        assert_eq!(
+            chunks,
+            vec![
+                format!("{}\n", "a".repeat(DISCORD_MESSAGE_LIMIT - 1)),
+                "small".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn first_chunk_and_live_display_are_sendable() {
+        assert_eq!(first_discord_chunk(""), " ");
+        assert_eq!(
+            first_discord_chunk(&"a".repeat(DISCORD_MESSAGE_LIMIT + 1)).len(),
+            DISCORD_MESSAGE_LIMIT
+        );
+        assert_eq!(live_display("moni", "  hello"), "<- [moni]\nhello |");
+    }
+
+    #[test]
+    fn live_message_edit_deadline_defaults_to_ready() {
+        let mut live = DiscordLiveMessages::default();
+        assert!(live.ready_to_edit());
+        live.next_edit_at = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!live.ready_to_edit());
+        live.next_edit_at = Some(Instant::now() - Duration::from_secs(1));
+        assert!(live.ready_to_edit());
     }
 }

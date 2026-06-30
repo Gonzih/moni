@@ -78,6 +78,18 @@ mod tests {
         assert_eq!(store.load().await.unwrap(), MoniState::default());
     }
 
+    #[test]
+    fn temp_state_path_uses_default_name_when_path_has_no_file_name() {
+        let path = temp_state_path(std::path::Path::new(""));
+
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("state.json.")
+        );
+    }
+
     #[tokio::test]
     async fn state_round_trips_file() {
         let dir = TempDir::new().unwrap();

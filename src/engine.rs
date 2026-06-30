@@ -38,6 +38,7 @@ pub struct EngineConfig {
     pub command: PathBuf,
     pub args: Vec<String>,
     pub protocol: AgentProtocol,
+    pub model: Option<String>,
 }
 
 impl EngineConfig {
@@ -47,6 +48,7 @@ impl EngineConfig {
             command: command.into(),
             args: Vec::new(),
             protocol: AgentProtocol::Line,
+            model: None,
         }
     }
 
@@ -57,6 +59,11 @@ impl EngineConfig {
 
     pub fn with_protocol(mut self, protocol: AgentProtocol) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 }
@@ -124,6 +131,7 @@ mod tests {
         assert_eq!(config.command, PathBuf::from("/bin/echo"));
         assert!(config.args.is_empty());
         assert_eq!(config.protocol, AgentProtocol::Line);
+        assert_eq!(config.model, None);
     }
 
     #[test]
@@ -139,5 +147,12 @@ mod tests {
             .with_protocol(AgentProtocol::CodexAppServer);
 
         assert_eq!(config.protocol, AgentProtocol::CodexAppServer);
+    }
+
+    #[test]
+    fn engine_config_can_select_model() {
+        let config = EngineConfig::new(AgentEngine::Codex, "codex").with_model("gpt-5-codex");
+
+        assert_eq!(config.model.as_deref(), Some("gpt-5-codex"));
     }
 }

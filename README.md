@@ -12,6 +12,7 @@ Rust successor to `cc-discord`.
 - In-memory bus implementation for integration tests.
 - Discord gateway adapter that routes registered channel messages into NATS.
 - Dynamic `/register <namespace> <repo_url>` support from Discord.
+- Discord `/model <name>` command for per-namespace model selection.
 - JSON state persistence for channel bindings and cron tasks via `MONI_STATE_PATH`.
 - NATS wildcard consumer that drives persistent per-namespace agent sessions.
 - Agent stdout routed back to Discord through the namespace/channel registry.
@@ -44,6 +45,7 @@ export MONI_ENGINE="codex"
 export MONI_AGENT_BIN="codex"
 export MONI_CODEX_APP_SERVER="1"
 export MONI_ALLOWED_USER_IDS="111111111111111111,222222222222222222"
+export MONI_DISCORD_SLASH_GUILD_IDS="333333333333333333"
 export MONI_CRON_TICK_SECONDS="30"
 export RUST_LOG="moni=info,warn"
 cargo run
@@ -91,6 +93,7 @@ Runtime environment:
 - `MONI_AGENT_ARGS`: whitespace-separated agent arguments. For line-mode Codex, the current unsafe automation flag is `--dangerously-bypass-approvals-and-sandbox`.
 - `MONI_CODEX_APP_SERVER`: when `1`, `true`, or `yes`, runs Codex through `codex app-server --stdio`, starts a JSON-RPC thread, submits Discord/NATS prompts with `turn/start`, and flushes aggregated assistant deltas on `turnCompleted`.
 - `MONI_ALLOWED_USER_IDS`: optional comma-separated Discord user IDs. Empty means any non-bot user in a reachable channel can interact with the runner.
+- `MONI_DISCORD_SLASH_GUILD_IDS`: optional comma-separated guild IDs for immediate slash command publication. Empty registers global commands, which Discord can take time to propagate.
 - `MONI_CRON_TICK_SECONDS`: cron polling interval, default `30`.
 - `RUST_LOG`: tracing filter, default `moni=info,warn`.
 
@@ -107,7 +110,7 @@ docker run -d --rm -p 4224:4222 nats:2-alpine
 MONI_TEST_NATS_URL=nats://127.0.0.1:4224 cargo test live_nats_publish_reaches_session_manager_when_configured -- --nocapture
 ```
 
-The remaining confidence gap is live Discord validation with a real bot token/guild/channel. Unit and integration-style tests cover the runtime seams with mock agents, memory queues, dynamic registration, state persistence, cron, process lifecycle, Discord output formatting, authorization config, Codex app-server JSON-RPC session flow, and live NATS publish/consume behavior.
+Unit and integration-style tests are the verification boundary. They cover the runtime seams with mock agents, memory queues, dynamic registration, state persistence, cron, process lifecycle, Discord command routing, Discord output formatting, authorization config, Codex app-server JSON-RPC session flow, and live NATS publish/consume behavior.
 
 ## Known Replacement Gaps
 

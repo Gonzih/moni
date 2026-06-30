@@ -4,6 +4,7 @@ pub enum CommandAction {
     Reset,
     Clear,
     Compact,
+    SetModel { model: String },
     CronAdd { schedule: String, message: String },
     CronList,
     CronPause { id: String },
@@ -28,9 +29,7 @@ pub fn parse_command(
     }
 
     let mut parts = trimmed.split_whitespace();
-    let Some(command) = parts.next() else {
-        return Ok(None);
-    };
+    let command = parts.next().expect("trimmed command starts with slash");
 
     let action = match command {
         "/register" => {
@@ -50,9 +49,17 @@ pub fn parse_command(
         "/reset" => CommandAction::Reset,
         "/clear" => CommandAction::Clear,
         "/compact" => CommandAction::Compact,
+        "/model" => CommandAction::SetModel {
+            model: parts.collect::<Vec<_>>().join(" "),
+        },
         "/cron" => parse_cron_command(parts.collect::<Vec<_>>())?,
         _ => return Ok(None),
     };
+    if let CommandAction::SetModel { model } = &action {
+        if model.trim().is_empty() {
+            anyhow::bail!("missing model");
+        }
+    }
 
     Ok(Some(ParsedCommand { namespace, action }))
 }
@@ -156,6 +163,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_model_selection() {
+        assert_eq!(
+            parse_command("moni", "/model prompt")
+                .unwrap()
+                .unwrap()
+                .action,
+            CommandAction::SetModel {
+                model: "prompt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn model_selection_requires_model() {
+        assert!(parse_command("moni", "/model").is_err());
+        assert!(parse_command("moni", "/model   ").is_err());
+    }
+
+    #[test]
     fn command_preserves_namespace() {
         assert_eq!(
             parse_command("ops", "/reset").unwrap().unwrap().namespace,
@@ -232,6 +258,12 @@ mod tests {
     #[test]
     fn cron_pause_requires_id() {
         assert!(parse_command("moni", "/cron pause").is_err());
+    }
+
+    #[test]
+    fn cron_requires_subcommand() {
+        let err = parse_command("moni", "/cron").unwrap_err();
+        assert!(err.to_string().contains("missing cron subcommand"));
     }
 
     #[test]

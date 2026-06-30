@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
 
 use crate::app::MoniApp;
@@ -49,8 +49,25 @@ pub async fn run_nats_prompt_consumer(
     client: async_nats::Client,
     app: Arc<MoniApp>,
 ) -> anyhow::Result<()> {
-    let mut subscriber = client.subscribe("moni.namespace.*.input").await?;
-    while let Some(message) = subscriber.next().await {
+    let subscriber = client.subscribe("moni.namespace.*.input").await?;
+    let messages = subscriber.map(|message| NatsPromptMessage {
+        subject: message.subject.to_string(),
+        payload: message.payload.to_vec(),
+    });
+    consume_nats_prompt_messages(messages, app).await
+}
+
+struct NatsPromptMessage {
+    subject: String,
+    payload: Vec<u8>,
+}
+
+async fn consume_nats_prompt_messages<S>(messages: S, app: Arc<MoniApp>) -> anyhow::Result<()>
+where
+    S: Stream<Item = NatsPromptMessage>,
+{
+    futures_util::pin_mut!(messages);
+    while let Some(message) = messages.next().await {
         let Ok(prompt) = decode_nats_prompt(&message.payload) else {
             tracing::warn!(
                 subject = %message.subject,
@@ -77,6 +94,39 @@ fn decode_nats_prompt(payload: &[u8]) -> anyhow::Result<QueuedPrompt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use tempfile::TempDir;
+
+    use crate::{
+        app::{MoniApp, MoniAppConfig},
+        cron::CronEngine,
+        engine::{AgentEngine, EngineConfig},
+        output::InMemoryOutputSink,
+        queue::InMemoryNamespaceQueue,
+        registry::BindingRegistry,
+        session::{SessionManager, StaticEngineConfigResolver},
+    };
+
+    fn app_with_agent_bin(dir: &TempDir, bin: impl Into<std::path::PathBuf>) -> Arc<MoniApp> {
+        let output = InMemoryOutputSink::default();
+        let resolver = Arc::new(StaticEngineConfigResolver::new(EngineConfig::new(
+            AgentEngine::Claude,
+            bin,
+        )));
+        let sessions = Arc::new(SessionManager::new(
+            dir.path().join("workspaces"),
+            resolver,
+            Arc::new(output.clone()),
+        ));
+        Arc::new(MoniApp::new(MoniAppConfig {
+            queue: Arc::new(InMemoryNamespaceQueue::default()),
+            sessions,
+            output: Arc::new(output),
+            cron: CronEngine::default(),
+            registry: BindingRegistry::new(Vec::new()).unwrap(),
+            state_store: None,
+        }))
+    }
 
     #[test]
     fn encodes_namespace_subject() {
@@ -127,8 +177,68 @@ mod tests {
         // encoding. The trait rejection is covered by the implementation body.
     }
 
+    #[tokio::test]
+    async fn live_nats_connect_client_and_drain_rejection_when_configured() {
+        let nats_url =
+            std::env::var("MONI_TEST_NATS_URL").unwrap_or("nats://127.0.0.1:4223".to_string());
+
+        let queue = NatsNamespaceQueue::connect(&nats_url).await.unwrap();
+        let client = queue.client();
+        client.flush().await.unwrap();
+
+        let err = queue.drain_namespace("moni").await.unwrap_err();
+        assert!(err.to_string().contains("does not support"));
+    }
+
+    #[tokio::test]
+    async fn live_nats_prompt_consumer_returns_after_client_drain() {
+        let nats_url =
+            std::env::var("MONI_TEST_NATS_URL").unwrap_or("nats://127.0.0.1:4223".to_string());
+        let dir = TempDir::new().unwrap();
+        let client = async_nats::connect(&nats_url).await.unwrap();
+        let app = app_with_agent_bin(&dir, dir.path().join("missing-agent"));
+        let consumer = tokio::spawn(run_nats_prompt_consumer(client.clone(), app));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        client.drain().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), consumer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn wildcard_subject_matches_namespace_inputs() {
         assert_eq!("moni.namespace.*.input", "moni.namespace.*.input");
+    }
+
+    #[tokio::test]
+    async fn prompt_consumer_stream_completes_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let app = app_with_agent_bin(&dir, dir.path().join("missing-agent"));
+
+        consume_nats_prompt_messages(stream::empty(), app)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_consumer_logs_app_handling_errors_and_continues() {
+        let dir = TempDir::new().unwrap();
+        let app = app_with_agent_bin(&dir, dir.path().join("missing-agent"));
+        let prompt = QueuedPrompt::new("moni", None, "hello", "test");
+        let (_, payload) = encode_nats_prompt(&prompt).unwrap();
+
+        consume_nats_prompt_messages(
+            stream::iter([NatsPromptMessage {
+                subject: "moni.namespace.moni.input".to_string(),
+                payload,
+            }]),
+            app,
+        )
+        .await
+        .unwrap();
     }
 }

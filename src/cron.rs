@@ -266,6 +266,15 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_year_schedule_should_not_fire() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
+        let mut task = CronTask::new("moni", "repo", "0 0 0 1 1 * 2020", "run");
+        task.created_at = Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0).unwrap();
+
+        assert!(!task.should_fire_at(now).unwrap());
+    }
+
+    #[test]
     fn invalid_schedule_returns_error() {
         let now = Utc.with_ymd_and_hms(2026, 6, 23, 8, 1, 0).unwrap();
         let mut task = CronTask::new("moni", "repo", "not cron", "run");
