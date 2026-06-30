@@ -15,6 +15,11 @@ const WHISPER_MODEL_NAMES: &[&str] = &[
     "ggml-tiny.en.bin",
     "ggml-tiny.bin",
 ];
+const DEFAULT_VOICE_PROMPT_TEMPLATE: &str =
+    "[voice note - transcription may contain typos]: {content}";
+const DEFAULT_MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+const DEFAULT_MAX_DURATION_SECONDS: u64 = 10 * 60;
+const WAV_BYTES_PER_SECOND: u64 = 16_000 * 2;
 
 #[derive(Debug, Clone)]
 pub struct VoiceTranscriber {
@@ -23,6 +28,9 @@ pub struct VoiceTranscriber {
     curl_bin: PathBuf,
     model: PathBuf,
     temp_dir: PathBuf,
+    prompt_template: String,
+    max_audio_bytes: u64,
+    max_duration_seconds: u64,
 }
 
 impl VoiceTranscriber {
@@ -88,6 +96,15 @@ impl VoiceTranscriber {
             curl_bin,
             model,
             temp_dir: env::temp_dir(),
+            prompt_template: env::var("MONI_VOICE_PROMPT_TEMPLATE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_VOICE_PROMPT_TEMPLATE.to_string()),
+            max_audio_bytes: env_positive_u64("MONI_VOICE_MAX_BYTES", DEFAULT_MAX_AUDIO_BYTES)?,
+            max_duration_seconds: env_positive_u64(
+                "MONI_VOICE_MAX_DURATION_SECONDS",
+                DEFAULT_MAX_DURATION_SECONDS,
+            )?,
         })
     }
 
@@ -104,7 +121,45 @@ impl VoiceTranscriber {
             curl_bin: curl_bin.into(),
             model: model.into(),
             temp_dir: temp_dir.into(),
+            prompt_template: DEFAULT_VOICE_PROMPT_TEMPLATE.to_string(),
+            max_audio_bytes: DEFAULT_MAX_AUDIO_BYTES,
+            max_duration_seconds: DEFAULT_MAX_DURATION_SECONDS,
         }
+    }
+
+    pub fn status_report(&self) -> String {
+        format!(
+            "voice transcription configured\nwhisper.cpp: {}\nffmpeg: {}\ncurl: {}\nmodel: {}\nmax bytes: {}\nmax duration: {}s",
+            path_status(&self.whisper_bin),
+            path_status(&self.ffmpeg_bin),
+            path_status(&self.curl_bin),
+            path_status(&self.model),
+            self.max_audio_bytes,
+            self.max_duration_seconds
+        )
+    }
+
+    pub fn with_prompt_template(mut self, template: impl Into<String>) -> Self {
+        self.prompt_template = template.into();
+        self
+    }
+
+    pub fn with_guardrails(mut self, max_audio_bytes: u64, max_duration_seconds: u64) -> Self {
+        self.max_audio_bytes = max_audio_bytes;
+        self.max_duration_seconds = max_duration_seconds;
+        self
+    }
+
+    pub fn validate_attachment_size(&self, size: Option<u64>) -> anyhow::Result<()> {
+        if let Some(size) = size {
+            validate_audio_size(size, self.max_audio_bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn build_prompt(&self, caption: &str, transcript: &str) -> String {
+        let content = voice_prompt_content(caption, transcript);
+        self.prompt_template.replace("{content}", &content)
     }
 
     pub async fn transcribe_url(&self, url: &str) -> anyhow::Result<String> {
@@ -121,6 +176,7 @@ impl VoiceTranscriber {
             )
             .await
             .map_err(|err| anyhow::anyhow!("audio download failed: {err}"))?;
+            validate_audio_size(fs::metadata(&audio_path)?.len(), self.max_audio_bytes)?;
 
             run_command(
                 &self.ffmpeg_bin,
@@ -140,6 +196,7 @@ impl VoiceTranscriber {
             )
             .await
             .map_err(|err| anyhow::anyhow!("ffmpeg conversion failed: {err}"))?;
+            validate_wav_duration(&wav_path, self.max_duration_seconds)?;
 
             let lang = if self.model.to_string_lossy().contains(".en.") {
                 "en"
@@ -176,6 +233,17 @@ impl VoiceTranscriber {
     }
 }
 
+fn path_status(path: &Path) -> String {
+    let state = if path.is_file() {
+        "ok"
+    } else if path.exists() {
+        "not a file"
+    } else {
+        "missing"
+    };
+    format!("{state} ({})", path.display())
+}
+
 pub fn is_audio_attachment(filename: &str, content_type: Option<&str>) -> bool {
     if content_type
         .map(|content_type| content_type.to_ascii_lowercase().starts_with("audio/"))
@@ -191,14 +259,50 @@ pub fn is_audio_attachment(filename: &str, content_type: Option<&str>) -> bool {
 }
 
 pub fn build_voice_prompt(caption: &str, transcript: &str) -> String {
+    DEFAULT_VOICE_PROMPT_TEMPLATE.replace("{content}", &voice_prompt_content(caption, transcript))
+}
+
+fn voice_prompt_content(caption: &str, transcript: &str) -> String {
     let caption = caption.trim();
     let transcript = transcript.trim();
-    let full = if caption.is_empty() {
+    if caption.is_empty() {
         transcript.to_string()
     } else {
         format!("{caption}\n\n{transcript}")
+    }
+}
+
+fn env_positive_u64(key: &str, default: u64) -> anyhow::Result<u64> {
+    let Ok(raw) = env::var(key) else {
+        return Ok(default);
     };
-    format!("[voice note - transcription may contain typos]: {full}")
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|err| anyhow::anyhow!("{key} must be a positive integer: {err}"))?;
+    if parsed == 0 {
+        anyhow::bail!("{key} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn validate_audio_size(size: u64, max_audio_bytes: u64) -> anyhow::Result<()> {
+    if size > max_audio_bytes {
+        anyhow::bail!("voice attachment is too large: {size} bytes exceeds {max_audio_bytes}");
+    }
+    Ok(())
+}
+
+fn validate_wav_duration(path: &Path, max_duration_seconds: u64) -> anyhow::Result<()> {
+    let size = fs::metadata(path)?.len();
+    let max_wav_bytes = max_duration_seconds
+        .saturating_mul(WAV_BYTES_PER_SECOND)
+        .saturating_add(4096);
+    if size > max_wav_bytes {
+        anyhow::bail!(
+            "voice attachment is too long: converted audio exceeds {max_duration_seconds}s"
+        );
+    }
+    Ok(())
 }
 
 fn env_candidates(key: &str, defaults: &[&str]) -> Vec<PathBuf> {
@@ -323,18 +427,30 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
-    fn voice_env_snapshot() -> [(&'static str, Option<String>); 6] {
+    fn voice_env_snapshot() -> [(&'static str, Option<String>); 9] {
         [
             ("WHISPER_BIN", env::var("WHISPER_BIN").ok()),
             ("FFMPEG_BIN", env::var("FFMPEG_BIN").ok()),
             ("CURL_BIN", env::var("CURL_BIN").ok()),
             ("WHISPER_MODEL", env::var("WHISPER_MODEL").ok()),
             ("WHISPER_MODEL_DIR", env::var("WHISPER_MODEL_DIR").ok()),
+            (
+                "MONI_VOICE_PROMPT_TEMPLATE",
+                env::var("MONI_VOICE_PROMPT_TEMPLATE").ok(),
+            ),
+            (
+                "MONI_VOICE_MAX_BYTES",
+                env::var("MONI_VOICE_MAX_BYTES").ok(),
+            ),
+            (
+                "MONI_VOICE_MAX_DURATION_SECONDS",
+                env::var("MONI_VOICE_MAX_DURATION_SECONDS").ok(),
+            ),
             ("HOME", env::var("HOME").ok()),
         ]
     }
 
-    fn restore_voice_env(old: [(&'static str, Option<String>); 6]) {
+    fn restore_voice_env(old: [(&'static str, Option<String>); 9]) {
         unsafe {
             for (key, value) in old {
                 if let Some(value) = value {
@@ -356,6 +472,14 @@ mod tests {
         }
     }
 
+    fn clear_voice_config_env() {
+        unsafe {
+            env::remove_var("MONI_VOICE_PROMPT_TEMPLATE");
+            env::remove_var("MONI_VOICE_MAX_BYTES");
+            env::remove_var("MONI_VOICE_MAX_DURATION_SECONDS");
+        }
+    }
+
     #[test]
     fn restore_test_env_sets_and_removes_values() {
         let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
@@ -371,6 +495,28 @@ mod tests {
     }
 
     #[test]
+    fn transcriber_status_report_checks_configured_paths() {
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let ffmpeg = dir.path().join("ffmpeg-dir");
+        let curl = dir.path().join("curl");
+        let model = dir.path().join("ggml-small.en.bin");
+        fs::write(&whisper, "bin").unwrap();
+        fs::create_dir(&ffmpeg).unwrap();
+        fs::write(&model, "model").unwrap();
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path());
+
+        let report = transcriber.status_report();
+
+        assert!(report.contains("whisper.cpp: ok"));
+        assert!(report.contains("ffmpeg: not a file"));
+        assert!(report.contains("curl: missing"));
+        assert!(report.contains("model: ok"));
+        assert!(report.contains("max bytes: 26214400"));
+        assert!(report.contains("max duration: 600s"));
+    }
+
+    #[test]
     fn audio_detection_accepts_voice_mime() {
         assert!(is_audio_attachment("voice.dat", Some("audio/ogg")));
         assert!(is_audio_attachment("voice.m4a", None));
@@ -383,6 +529,36 @@ mod tests {
             build_voice_prompt("caption", "hello"),
             "[voice note - transcription may contain typos]: caption\n\nhello"
         );
+    }
+
+    #[test]
+    fn transcriber_prompt_uses_configured_template() {
+        let transcriber = VoiceTranscriber::new("whisper", "ffmpeg", "curl", "model.bin", "tmp")
+            .with_prompt_template("voice says:\n{content}");
+
+        assert_eq!(
+            transcriber.build_prompt("caption", "hello"),
+            "voice says:\ncaption\n\nhello"
+        );
+    }
+
+    #[test]
+    fn attachment_size_guard_accepts_unknown_or_small_sizes() {
+        let transcriber = VoiceTranscriber::new("whisper", "ffmpeg", "curl", "model.bin", "tmp")
+            .with_guardrails(10, 60);
+
+        transcriber.validate_attachment_size(None).unwrap();
+        transcriber.validate_attachment_size(Some(10)).unwrap();
+    }
+
+    #[test]
+    fn attachment_size_guard_rejects_large_sizes() {
+        let transcriber = VoiceTranscriber::new("whisper", "ffmpeg", "curl", "model.bin", "tmp")
+            .with_guardrails(10, 60);
+
+        let err = transcriber.validate_attachment_size(Some(11)).unwrap_err();
+
+        assert!(err.to_string().contains("voice attachment is too large"));
     }
 
     #[test]
@@ -479,6 +655,42 @@ mod tests {
     }
 
     #[test]
+    fn env_positive_u64_uses_default_and_accepts_positive_values() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let original = env::var("MONI_TEST_POSITIVE").ok();
+        unsafe {
+            env::remove_var("MONI_TEST_POSITIVE");
+        }
+        assert_eq!(env_positive_u64("MONI_TEST_POSITIVE", 7).unwrap(), 7);
+
+        unsafe {
+            env::set_var("MONI_TEST_POSITIVE", "12");
+        }
+        assert_eq!(env_positive_u64("MONI_TEST_POSITIVE", 7).unwrap(), 12);
+
+        restore_test_env("MONI_TEST_POSITIVE", original);
+    }
+
+    #[test]
+    fn env_positive_u64_rejects_zero_and_parse_errors() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let original = env::var("MONI_TEST_POSITIVE").ok();
+        unsafe {
+            env::set_var("MONI_TEST_POSITIVE", "0");
+        }
+        let zero = env_positive_u64("MONI_TEST_POSITIVE", 7).unwrap_err();
+        assert!(zero.to_string().contains("greater than zero"));
+
+        unsafe {
+            env::set_var("MONI_TEST_POSITIVE", "nope");
+        }
+        let parse = env_positive_u64("MONI_TEST_POSITIVE", 7).unwrap_err();
+        assert!(parse.to_string().contains("positive integer"));
+
+        restore_test_env("MONI_TEST_POSITIVE", original);
+    }
+
+    #[test]
     fn audio_extension_is_detected_from_url() {
         assert_eq!(audio_extension_from_url("https://cdn/x.m4a?token=1"), "m4a");
         assert_eq!(audio_extension_from_url("https://cdn/no-extension"), "ogg");
@@ -552,14 +764,7 @@ sleep 2
         }
         fs::write(&model, "model").unwrap();
 
-        let old = [
-            ("WHISPER_BIN", env::var("WHISPER_BIN").ok()),
-            ("FFMPEG_BIN", env::var("FFMPEG_BIN").ok()),
-            ("CURL_BIN", env::var("CURL_BIN").ok()),
-            ("WHISPER_MODEL", env::var("WHISPER_MODEL").ok()),
-            ("WHISPER_MODEL_DIR", env::var("WHISPER_MODEL_DIR").ok()),
-            ("HOME", env::var("HOME").ok()),
-        ];
+        let old = voice_env_snapshot();
         unsafe {
             env::set_var("WHISPER_BIN", &whisper);
             env::set_var("FFMPEG_BIN", &ffmpeg);
@@ -568,6 +773,7 @@ sleep 2
             env::set_var("WHISPER_MODEL_DIR", &model_dir);
             env::set_var("HOME", dir.path());
         }
+        clear_voice_config_env();
 
         let transcriber = VoiceTranscriber::from_env().unwrap();
         assert_eq!(transcriber.whisper_bin, whisper);
@@ -575,15 +781,76 @@ sleep 2
         assert_eq!(transcriber.curl_bin, curl);
         assert_eq!(transcriber.model, model);
 
-        unsafe {
-            for (key, value) in old {
-                if let Some(value) = value {
-                    env::set_var(key, value);
-                } else {
-                    env::remove_var(key);
-                }
-            }
+        restore_voice_env(old);
+    }
+
+    #[test]
+    fn from_env_uses_voice_prompt_template_and_guardrails() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let curl = dir.path().join("curl");
+        let model = dir.path().join("ggml-small.en.bin");
+        for bin in [&whisper, &ffmpeg, &curl] {
+            write_script(bin, "#!/bin/sh\nexit 0\n");
         }
+        fs::write(&model, "model").unwrap();
+        let old = voice_env_snapshot();
+        unsafe {
+            env::set_var("WHISPER_BIN", &whisper);
+            env::set_var("FFMPEG_BIN", &ffmpeg);
+            env::set_var("CURL_BIN", &curl);
+            env::set_var("WHISPER_MODEL", &model);
+            env::remove_var("WHISPER_MODEL_DIR");
+            env::set_var("MONI_VOICE_PROMPT_TEMPLATE", "voice:\n{content}");
+            env::set_var("MONI_VOICE_MAX_BYTES", "3");
+            env::set_var("MONI_VOICE_MAX_DURATION_SECONDS", "4");
+            env::set_var("HOME", dir.path());
+        }
+
+        let transcriber = VoiceTranscriber::from_env().unwrap();
+
+        restore_voice_env(old);
+        assert_eq!(
+            transcriber.build_prompt("caption", "hello"),
+            "voice:\ncaption\n\nhello"
+        );
+        assert!(transcriber.validate_attachment_size(Some(4)).is_err());
+        let report = transcriber.status_report();
+        assert!(report.contains("max bytes: 3"));
+        assert!(report.contains("max duration: 4s"));
+    }
+
+    #[test]
+    fn from_env_reports_invalid_duration_guardrail() {
+        let _guard = ENV_LOCK.lock().expect("voice env lock poisoned");
+        let dir = TempDir::new().unwrap();
+        let whisper = dir.path().join("whisper-cli");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let curl = dir.path().join("curl");
+        let model = dir.path().join("ggml-small.en.bin");
+        for bin in [&whisper, &ffmpeg, &curl] {
+            write_script(bin, "#!/bin/sh\nexit 0\n");
+        }
+        fs::write(&model, "model").unwrap();
+        let old = voice_env_snapshot();
+        unsafe {
+            env::set_var("WHISPER_BIN", &whisper);
+            env::set_var("FFMPEG_BIN", &ffmpeg);
+            env::set_var("CURL_BIN", &curl);
+            env::set_var("WHISPER_MODEL", &model);
+            env::remove_var("WHISPER_MODEL_DIR");
+            env::remove_var("MONI_VOICE_PROMPT_TEMPLATE");
+            env::set_var("MONI_VOICE_MAX_BYTES", "3");
+            env::set_var("MONI_VOICE_MAX_DURATION_SECONDS", "nope");
+            env::set_var("HOME", dir.path());
+        }
+
+        let err = VoiceTranscriber::from_env().unwrap_err();
+
+        restore_voice_env(old);
+        assert!(err.to_string().contains("MONI_VOICE_MAX_DURATION_SECONDS"));
     }
 
     #[test]
@@ -599,14 +866,7 @@ sleep 2
             write_script(bin, "#!/bin/sh\nexit 0\n");
         }
 
-        let old = [
-            ("WHISPER_BIN", env::var("WHISPER_BIN").ok()),
-            ("FFMPEG_BIN", env::var("FFMPEG_BIN").ok()),
-            ("CURL_BIN", env::var("CURL_BIN").ok()),
-            ("WHISPER_MODEL", env::var("WHISPER_MODEL").ok()),
-            ("WHISPER_MODEL_DIR", env::var("WHISPER_MODEL_DIR").ok()),
-            ("HOME", env::var("HOME").ok()),
-        ];
+        let old = voice_env_snapshot();
         unsafe {
             env::set_var("WHISPER_BIN", &whisper);
             env::set_var("FFMPEG_BIN", &ffmpeg);
@@ -615,19 +875,12 @@ sleep 2
             env::set_var("WHISPER_MODEL_DIR", &empty_model_dir);
             env::set_var("HOME", dir.path());
         }
+        clear_voice_config_env();
 
         let err = VoiceTranscriber::from_env().unwrap_err();
         assert!(err.to_string().contains("No whisper model found"));
 
-        unsafe {
-            for (key, value) in old {
-                if let Some(value) = value {
-                    env::set_var(key, value);
-                } else {
-                    env::remove_var(key);
-                }
-            }
-        }
+        restore_voice_env(old);
     }
 
     #[test]
@@ -648,6 +901,7 @@ sleep 2
             env::set_var("WHISPER_MODEL", &model);
             env::remove_var("WHISPER_MODEL_DIR");
         }
+        clear_voice_config_env();
 
         let err = VoiceTranscriber::from_env().unwrap_err();
 
@@ -673,6 +927,7 @@ sleep 2
             env::set_var("WHISPER_MODEL", &model);
             env::remove_var("WHISPER_MODEL_DIR");
         }
+        clear_voice_config_env();
 
         let err = VoiceTranscriber::from_env().unwrap_err();
 
@@ -701,6 +956,7 @@ sleep 2
             env::remove_var("WHISPER_MODEL_DIR");
             env::remove_var("HOME");
         }
+        clear_voice_config_env();
 
         let transcriber = VoiceTranscriber::from_env().unwrap();
 
@@ -751,6 +1007,76 @@ printf "hello from voice" > "$wav.txt"
             .unwrap();
 
         assert_eq!(transcript, "hello from voice");
+    }
+
+    #[tokio::test]
+    async fn transcriber_rejects_downloaded_audio_larger_than_guardrail() {
+        let dir = TempDir::new().unwrap();
+        let curl = dir.path().join("curl");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let whisper = dir.path().join("whisper-cli");
+        let model = dir.path().join("ggml-small.en.bin");
+        fs::write(&model, "model").unwrap();
+        write_script(
+            &curl,
+            r#"#!/bin/sh
+while [ "$1" != "-o" ]; do shift; done
+shift
+printf audio > "$1"
+"#,
+        );
+        write_script(&ffmpeg, "#!/bin/sh\necho should not convert >&2\nexit 7\n");
+        write_script(&whisper, "#!/bin/sh\nexit 0\n");
+
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path())
+            .with_guardrails(4, 60);
+
+        let err = transcriber
+            .transcribe_url("https://cdn.discordapp.com/voice.ogg")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("voice attachment is too large"));
+    }
+
+    #[tokio::test]
+    async fn transcriber_rejects_converted_audio_longer_than_guardrail() {
+        let dir = TempDir::new().unwrap();
+        let curl = dir.path().join("curl");
+        let ffmpeg = dir.path().join("ffmpeg");
+        let whisper = dir.path().join("whisper-cli");
+        let model = dir.path().join("ggml-small.en.bin");
+        fs::write(&model, "model").unwrap();
+        write_script(
+            &curl,
+            r#"#!/bin/sh
+while [ "$1" != "-o" ]; do shift; done
+shift
+printf audio > "$1"
+"#,
+        );
+        write_script(
+            &ffmpeg,
+            r#"#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+dd if=/dev/zero bs=40000 count=1 of="$out" 2>/dev/null
+"#,
+        );
+        write_script(
+            &whisper,
+            "#!/bin/sh\necho should not transcribe >&2\nexit 8\n",
+        );
+
+        let transcriber = VoiceTranscriber::new(&whisper, &ffmpeg, &curl, &model, dir.path())
+            .with_guardrails(100, 1);
+
+        let err = transcriber
+            .transcribe_url("https://cdn.discordapp.com/voice.ogg")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("voice attachment is too long"));
     }
 
     #[tokio::test]

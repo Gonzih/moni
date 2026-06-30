@@ -28,7 +28,7 @@ use crate::commands::{CommandAction, parse_command};
 use crate::output::DiscordTypingTracker;
 use crate::queue::{NamespaceQueue, QueuedPrompt};
 use crate::registry::BindingRegistry;
-use crate::voice::{VoiceTranscriber, build_voice_prompt, is_audio_attachment};
+use crate::voice::{VoiceTranscriber, is_audio_attachment};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelBinding {
@@ -55,6 +55,7 @@ struct DiscordAttachmentInput {
     filename: String,
     content_type: Option<String>,
     url: String,
+    size: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,7 +224,7 @@ impl DiscordActions for SerenityDiscordActions<'_> {
     }
 
     async fn start_typing(&self, namespace: String, channel_id: ChannelId) -> anyhow::Result<()> {
-        self.typing.start(namespace, channel_id, &self.http).await;
+        self.typing.start(&namespace, channel_id, &self.http).await;
         Ok(())
     }
 
@@ -317,6 +318,7 @@ fn moni_slash_commands() -> Vec<CreateCommand> {
         CreateCommand::new("reset").description("Reset the agent session for this channel"),
         CreateCommand::new("clear").description("Clear the agent session for this channel"),
         CreateCommand::new("compact").description("Compact the agent session for this channel"),
+        CreateCommand::new("status").description("Show Moni status for this channel"),
         CreateCommand::new("model")
             .description("Select the agent model for this channel")
             .add_option(required_string_option("model", "Model name, e.g. prompt")),
@@ -335,6 +337,12 @@ fn moni_slash_commands() -> Vec<CreateCommand> {
             .add_option(required_string_option(
                 "repo",
                 "GitHub repo URL, e.g. https://github.com/org/repo",
+            )),
+        CreateCommand::new("voice")
+            .description("Inspect voice transcription setup")
+            .add_option(subcommand_option(
+                "status",
+                "Show voice transcription health",
             )),
         CreateCommand::new("cron")
             .description("Manage cron jobs for this channel")
@@ -406,7 +414,7 @@ fn discord_slash_option(option: &CommandDataOption) -> Option<DiscordSlashComman
 
 fn slash_command_body(input: &DiscordSlashCommandInput) -> anyhow::Result<Option<String>> {
     match input.name.as_str() {
-        "reset" | "clear" | "compact" => Ok(Some(format!("/{}", input.name))),
+        "reset" | "clear" | "compact" | "status" => Ok(Some(format!("/{}", input.name))),
         "model" => Ok(Some(format!(
             "/model {}",
             required_slash_string_option(&input.options, "model")?
@@ -417,7 +425,19 @@ fn slash_command_body(input: &DiscordSlashCommandInput) -> anyhow::Result<Option
             required_slash_string_option(&input.options, "repo")?
         ))),
         "cron" => Ok(Some(cron_slash_command_body(&input.options)?)),
+        "voice" => Ok(Some(voice_slash_command_body(&input.options)?)),
         _ => Ok(None),
+    }
+}
+
+fn voice_slash_command_body(options: &[DiscordSlashCommandOption]) -> anyhow::Result<String> {
+    let Some((subcommand, _sub_options)) = slash_subcommand(options) else {
+        anyhow::bail!("missing voice subcommand");
+    };
+
+    match subcommand {
+        "status" => Ok("/voice status".to_string()),
+        other => anyhow::bail!("unknown voice subcommand `{other}`"),
     }
 }
 
@@ -627,6 +647,9 @@ impl MoniDiscordHandler {
         };
         let preparsed =
             parse_command("", &body)?.expect("slash command body is a supported command");
+        if matches!(preparsed.action, CommandAction::VoiceStatus) {
+            return Ok(self.voice_status_message());
+        }
         let is_register = matches!(preparsed.action, CommandAction::Register { .. });
         let binding = if is_register {
             ChannelBinding {
@@ -663,6 +686,15 @@ impl MoniDiscordHandler {
         Ok(outcome.body)
     }
 
+    fn voice_status_message(&self) -> String {
+        self.voice_transcriber
+            .as_ref()
+            .map(VoiceTranscriber::status_report)
+            .unwrap_or_else(|| {
+                "voice transcription unavailable - whisper.cpp is not configured".to_string()
+            })
+    }
+
     async fn handle_voice_message_with_actions<A: DiscordActions + ?Sized>(
         &self,
         actions: &A,
@@ -690,6 +722,7 @@ impl MoniDiscordHandler {
             return Ok(true);
         };
 
+        transcriber.validate_attachment_size(attachment.size)?;
         let transcript = transcriber.transcribe_url(&attachment.url).await?;
         if transcript == "[empty transcription]" {
             actions.stop_typing(&binding.namespace).await?;
@@ -705,7 +738,7 @@ impl MoniDiscordHandler {
         let caption = message
             .content
             .replace(|ch: char| ch == '\n' || ch == '\r', " ");
-        let prompt = build_voice_prompt(&strip_discord_mentions(&caption), &transcript);
+        let prompt = transcriber.build_prompt(&strip_discord_mentions(&caption), &transcript);
         let inbound = DiscordInboundMessage {
             channel_id: message.channel_id.to_string(),
             author_id: message.author_id.clone(),
@@ -772,6 +805,19 @@ impl MoniDiscordHandler {
             namespace = %binding.namespace,
             "routing Discord message"
         );
+        match parse_command(binding.namespace.clone(), &message.content) {
+            Ok(Some(command)) if matches!(command.action, CommandAction::VoiceStatus) => {
+                if let Err(err) = actions
+                    .say(message.channel_id, self.voice_status_message())
+                    .await
+                {
+                    tracing::error!(channel_id = %binding.channel_id, namespace = %binding.namespace, error = %err, "failed to report voice status");
+                }
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
         match self
             .handle_voice_message_with_actions(actions, &message, &binding)
             .await
@@ -856,6 +902,7 @@ fn discord_message_input(message: &Message) -> DiscordMessageInput {
                 filename: attachment.filename.clone(),
                 content_type: attachment.content_type.clone(),
                 url: attachment.url.clone(),
+                size: Some(u64::from(attachment.size)),
             })
             .collect(),
     }
@@ -1034,6 +1081,7 @@ mod tests {
         creates: Vec<(GuildId, String, String, Option<ChannelId>)>,
         typing_started: Vec<(String, ChannelId)>,
         typing_stopped: Vec<String>,
+        fail_say: bool,
         fail_create: bool,
     }
 
@@ -1068,6 +1116,10 @@ mod tests {
 
         async fn fail_creates(&self) {
             self.state.lock().await.fail_create = true;
+        }
+
+        async fn fail_says(&self) {
+            self.state.lock().await.fail_say = true;
         }
     }
 
@@ -1116,6 +1168,7 @@ printf wav > "$out"
             cron: crate::CronEngine::new(Vec::new()),
             registry: registry.clone(),
             state_store: None,
+            voice_status: None,
         }));
         (app, registry, queue)
     }
@@ -1313,6 +1366,42 @@ printf wav > "$out"
         .unwrap()
     }
 
+    #[test]
+    fn discord_message_input_captures_attachment_size() {
+        let mut message = serenity_message(123, "42", "voice");
+        message.attachments.push(
+            serde_json::from_value(json!({
+                "id": "222",
+                "filename": "voice.ogg",
+                "description": null,
+                "height": null,
+                "proxy_url": "https://media.discordapp.net/voice.ogg",
+                "size": 12345,
+                "url": "https://cdn.discordapp.com/voice.ogg",
+                "width": null,
+                "content_type": "audio/ogg",
+                "ephemeral": false,
+                "duration_secs": 12.0,
+                "waveform": null
+            }))
+            .unwrap(),
+        );
+
+        let input = discord_message_input(&message);
+
+        assert_eq!(input.attachments.len(), 1);
+        assert_eq!(input.attachments[0].filename, "voice.ogg");
+        assert_eq!(
+            input.attachments[0].content_type.as_deref(),
+            Some("audio/ogg")
+        );
+        assert_eq!(
+            input.attachments[0].url,
+            "https://cdn.discordapp.com/voice.ogg"
+        );
+        assert_eq!(input.attachments[0].size, Some(12345));
+    }
+
     fn slash_interaction(
         channel_id: u64,
         guild_id: Option<u64>,
@@ -1349,7 +1438,11 @@ printf wav > "$out"
     #[serenity_async_trait]
     impl DiscordActions for FakeDiscordActions {
         async fn say(&self, channel_id: ChannelId, body: String) -> anyhow::Result<()> {
-            self.state.lock().await.says.push((channel_id, body));
+            let mut state = self.state.lock().await;
+            if state.fail_say {
+                anyhow::bail!("say failed");
+            }
+            state.says.push((channel_id, body));
             Ok(())
         }
 
@@ -1493,6 +1586,7 @@ printf wav > "$out"
             cron: crate::CronEngine::new(Vec::new()),
             registry: BindingRegistry::new(bindings.clone()).unwrap(),
             state_store: None,
+            voice_status: None,
         }));
         let handler = MoniDiscordHandler::new(
             app,
@@ -1519,7 +1613,8 @@ printf wav > "$out"
         assert_eq!(
             names,
             vec![
-                "reset", "clear", "compact", "model", "register", "channel", "cron"
+                "reset", "clear", "compact", "status", "model", "register", "channel", "voice",
+                "cron"
             ]
         );
         let model = commands
@@ -1546,6 +1641,13 @@ printf wav > "$out"
             cron_subcommands,
             vec!["list", "add", "pause", "resume", "delete"]
         );
+        let voice = commands
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "voice")
+            .unwrap();
+        assert_eq!(voice["options"][0]["name"], "status");
     }
 
     #[test]
@@ -1586,9 +1688,33 @@ printf wav > "$out"
             Some("/compact".to_string())
         );
         assert_eq!(
+            slash_command_body(&slash_input(123, "42", "status", Vec::new())).unwrap(),
+            Some("/status".to_string())
+        );
+        assert_eq!(
             slash_command_body(&slash_input(123, "42", "unknown", Vec::new())).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn slash_command_body_maps_voice_status_and_errors() {
+        assert_eq!(
+            voice_slash_command_body(&[slash_subcommand_option("status", Vec::new())]).unwrap(),
+            "/voice status"
+        );
+        assert_eq!(
+            slash_command_body(&slash_input(
+                123,
+                "42",
+                "voice",
+                vec![slash_subcommand_option("status", Vec::new())]
+            ))
+            .unwrap(),
+            Some("/voice status".to_string())
+        );
+        assert!(voice_slash_command_body(&[]).is_err());
+        assert!(voice_slash_command_body(&[slash_subcommand_option("bogus", Vec::new())]).is_err());
     }
 
     #[test]
@@ -1779,6 +1905,77 @@ printf wav > "$out"
         assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
         assert!(output.messages().await.is_empty());
         assert!(actions.state().await.says.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_status_command_reports_bound_namespace_status() {
+        let (handler, queue, output) =
+            handler_with_output(vec![binding_for_channel(123)], Vec::new(), None);
+        let actions = FakeDiscordActions::default();
+
+        let response = handler
+            .handle_slash_command_with_actions(&actions, slash_input(123, "42", "status", vec![]))
+            .await
+            .unwrap();
+
+        assert!(response.contains("namespace: moni"));
+        assert!(response.contains("repo: https://github.com/Gonzih/moni"));
+        assert!(response.contains("session: idle"));
+        assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
+        assert!(output.messages().await.is_empty());
+        assert!(actions.state().await.says.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_voice_status_reports_configured_and_unconfigured_health() {
+        let dir = TempDir::new().unwrap();
+        let transcriber = voice_transcriber(&dir, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let (handler, queue) = handler_with_bindings(
+            vec![binding_for_channel(123)],
+            Vec::new(),
+            Some(transcriber),
+        );
+        let actions = FakeDiscordActions::default();
+
+        let response = handler
+            .handle_slash_command_with_actions(
+                &actions,
+                slash_input(
+                    999,
+                    "42",
+                    "voice",
+                    vec![slash_subcommand_option("status", Vec::new())],
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.contains("voice transcription configured"));
+        assert!(response.contains("whisper.cpp: ok"));
+        assert!(response.contains("ffmpeg: ok"));
+        assert!(response.contains("curl: ok"));
+        assert!(response.contains("model: ok"));
+        assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
+        assert!(actions.state().await.says.is_empty());
+
+        let (handler, _queue) =
+            handler_with_bindings(vec![binding_for_channel(123)], Vec::new(), None);
+        let unconfigured = handler
+            .handle_slash_command_with_actions(
+                &actions,
+                slash_input(
+                    999,
+                    "42",
+                    "voice",
+                    vec![slash_subcommand_option("status", Vec::new())],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unconfigured,
+            "voice transcription unavailable - whisper.cpp is not configured"
+        );
     }
 
     #[tokio::test]
@@ -2349,6 +2546,46 @@ printf wav > "$out"
     }
 
     #[tokio::test]
+    async fn message_core_reports_voice_status_without_queueing() {
+        let dir = TempDir::new().unwrap();
+        let transcriber = voice_transcriber(&dir, "#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n");
+        let (handler, queue) = handler_with_bindings(
+            vec![binding_for_channel(123)],
+            Vec::new(),
+            Some(transcriber),
+        );
+        let actions = FakeDiscordActions::default();
+
+        handler
+            .handle_message_with_actions(&actions, discord_input(123, "42", "/voice status"))
+            .await;
+
+        let state = actions.state().await;
+        assert_eq!(state.says.len(), 1);
+        assert!(state.says[0].1.contains("voice transcription configured"));
+        assert!(state.says[0].1.contains("whisper.cpp: ok"));
+        assert!(state.typing_started.is_empty());
+        assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_core_logs_voice_status_response_failures_without_queueing() {
+        let (handler, queue) =
+            handler_with_bindings(vec![binding_for_channel(123)], Vec::new(), None);
+        let actions = FakeDiscordActions::default();
+        actions.fail_says().await;
+
+        handler
+            .handle_message_with_actions(&actions, discord_input(123, "42", "/voice status"))
+            .await;
+
+        let state = actions.state().await;
+        assert!(state.says.is_empty());
+        assert!(state.typing_started.is_empty());
+        assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn message_core_transcribes_voice_and_routes_prompt() {
         let dir = TempDir::new().unwrap();
         let transcriber = voice_transcriber(
@@ -2363,7 +2600,8 @@ while [ "$1" != "-f" ]; do shift; done
 shift
 printf "transcribed voice" > "$1.txt"
 "#,
-        );
+        )
+        .with_prompt_template("heard:\n{content}");
         let (handler, queue) = handler_with_bindings(
             vec![binding_for_channel(123)],
             Vec::new(),
@@ -2375,16 +2613,14 @@ printf "transcribed voice" > "$1.txt"
             filename: "voice.ogg".to_string(),
             content_type: Some("audio/ogg".to_string()),
             url: "https://cdn.discordapp.com/voice.ogg".to_string(),
+            size: Some(5),
         });
 
         handler.handle_message_with_actions(&actions, message).await;
 
         let queued = queue.drain_namespace("moni").await.unwrap();
         assert_eq!(queued.len(), 1);
-        assert_eq!(
-            queued[0].body,
-            "[voice note - transcription may contain typos]: caption next\n\ntranscribed voice"
-        );
+        assert_eq!(queued[0].body, "heard:\ncaption next\n\ntranscribed voice");
         assert!(actions.state().await.says.is_empty());
     }
 
@@ -2415,6 +2651,7 @@ printf "[BLANK_AUDIO]" > "$1.txt"
             filename: "voice.ogg".to_string(),
             content_type: Some("audio/ogg".to_string()),
             url: "https://cdn.discordapp.com/voice.ogg".to_string(),
+            size: Some(5),
         });
 
         handler.handle_message_with_actions(&actions, message).await;
@@ -2450,6 +2687,7 @@ printf "[BLANK_AUDIO]" > "$1.txt"
             filename: "voice.ogg".to_string(),
             content_type: Some("audio/ogg".to_string()),
             url: "https://cdn.discordapp.com/voice.ogg".to_string(),
+            size: Some(5),
         });
 
         handler.handle_message_with_actions(&actions, message).await;
@@ -2457,6 +2695,37 @@ printf "[BLANK_AUDIO]" > "$1.txt"
         let state = actions.state().await;
         assert_eq!(state.typing_stopped, vec!["moni".to_string()]);
         assert!(state.says[0].1.starts_with("Voice transcription failed:"));
+        assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_core_rejects_oversized_voice_attachment_before_download() {
+        let dir = TempDir::new().unwrap();
+        let transcriber = voice_transcriber(
+            &dir,
+            "#!/bin/sh\necho should not download >&2\nexit 9\n",
+            "#!/bin/sh\nexit 0\n",
+        )
+        .with_guardrails(4, 60);
+        let (handler, queue) = handler_with_bindings(
+            vec![binding_for_channel(123)],
+            Vec::new(),
+            Some(transcriber),
+        );
+        let actions = FakeDiscordActions::default();
+        let mut message = discord_input(123, "42", "caption");
+        message.attachments.push(DiscordAttachmentInput {
+            filename: "voice.ogg".to_string(),
+            content_type: Some("audio/ogg".to_string()),
+            url: "https://cdn.discordapp.com/voice.ogg".to_string(),
+            size: Some(5),
+        });
+
+        handler.handle_message_with_actions(&actions, message).await;
+
+        let state = actions.state().await;
+        assert_eq!(state.typing_stopped, vec!["moni".to_string()]);
+        assert!(state.says[0].1.contains("voice attachment is too large"));
         assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
     }
 
@@ -2503,6 +2772,7 @@ printf "[BLANK_AUDIO]" > "$1.txt"
             filename: "voice.ogg".to_string(),
             content_type: Some("audio/ogg".to_string()),
             url: "https://cdn.discordapp.com/voice.ogg".to_string(),
+            size: Some(5),
         });
 
         handler.handle_message_with_actions(&actions, message).await;
@@ -2778,6 +3048,7 @@ printf "[BLANK_AUDIO]" > "$1.txt"
                 cron: crate::CronEngine::new(Vec::new()),
                 registry: BindingRegistry::new(Vec::new()).unwrap(),
                 state_store: None,
+                voice_status: None,
             })),
             BindingRegistry::new(Vec::new()).unwrap(),
             ["42".to_string()],
@@ -2809,6 +3080,7 @@ printf "[BLANK_AUDIO]" > "$1.txt"
                 cron: crate::CronEngine::new(Vec::new()),
                 registry: BindingRegistry::new(Vec::new()).unwrap(),
                 state_store: None,
+                voice_status: None,
             })),
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             allowed_user_ids: HashSet::new(),
@@ -2837,6 +3109,7 @@ printf "[BLANK_AUDIO]" > "$1.txt"
                 cron: crate::CronEngine::new(Vec::new()),
                 registry: BindingRegistry::new(Vec::new()).unwrap(),
                 state_store: None,
+                voice_status: None,
             })),
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             allowed_user_ids: HashSet::from(["42".to_string()]),

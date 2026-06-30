@@ -4,6 +4,7 @@ pub mod cron;
 pub mod discord;
 pub mod engine;
 pub mod harness;
+pub mod history;
 pub mod nats;
 pub mod output;
 pub mod queue;
@@ -25,12 +26,14 @@ pub use discord::{
 };
 pub use engine::{AgentEngine, AgentProtocol, EngineConfig};
 pub use harness::{
-    AgentEvent, AgentEventStream, AgentHarness, AgentHarnessStatus, EventStreamKind,
-    ProcessAgentHarness, StopReason,
+    AgentEvent, AgentEventPayload, AgentEventStream, AgentHarness, AgentHarnessStatus,
+    EventStreamKind, ProcessAgentHarness, StopReason,
 };
+pub use history::{FileRunHistoryStore, RunHistory, RunHistoryState, RunHistoryStore, RunRecord};
 pub use nats::NatsNamespaceQueue;
 pub use output::{
-    DiscordOutputSink, DiscordTypingTracker, InMemoryOutputSink, OutputMessage, OutputSink,
+    DiscordLiveEditConfig, DiscordOutputSink, DiscordTypingTracker, InMemoryOutputSink,
+    OutputMessage, OutputSink,
 };
 pub use queue::{
     InMemoryNamespaceQueue, NamespaceQueue, QueuedPrompt, subject_for_namespace_input,

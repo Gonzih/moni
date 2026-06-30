@@ -6,23 +6,79 @@ use std::{
 
 use async_trait::async_trait;
 use serenity::{
+    Error as SerenityError,
     builder::{CreateMessage, EditMessage},
-    http::{Http, Typing},
+    http::{Http, HttpError, StatusCode, Typing},
     model::id::{ChannelId, MessageId},
 };
+use thiserror::Error;
 use tokio::{
     sync::Mutex,
     time::{Instant, sleep},
 };
 
-use crate::harness::{AgentEvent, EventStreamKind};
+use crate::harness::{AgentEvent, AgentEventPayload, EventStreamKind, TokenUsage};
 use crate::registry::BindingRegistry;
 
 const DISCORD_MESSAGE_LIMIT: usize = 1900;
 const DISCORD_SEND_ATTEMPTS: usize = 3;
-const LIVE_EDIT_MIN_INTERVAL: Duration = Duration::from_millis(900);
-const LIVE_EDIT_INITIAL_BACKOFF: Duration = Duration::from_millis(1500);
-const LIVE_EDIT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const DEFAULT_LIVE_EDIT_MIN_INTERVAL: Duration = Duration::from_millis(900);
+const DEFAULT_LIVE_EDIT_INITIAL_BACKOFF: Duration = Duration::from_millis(1500);
+const DEFAULT_LIVE_EDIT_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscordLiveEditConfig {
+    min_interval: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl Default for DiscordLiveEditConfig {
+    fn default() -> Self {
+        Self {
+            min_interval: DEFAULT_LIVE_EDIT_MIN_INTERVAL,
+            initial_backoff: DEFAULT_LIVE_EDIT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_LIVE_EDIT_MAX_BACKOFF,
+        }
+    }
+}
+
+impl DiscordLiveEditConfig {
+    pub fn new(
+        min_interval: Duration,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> anyhow::Result<Self> {
+        if min_interval.is_zero() {
+            anyhow::bail!("Discord live edit interval must be greater than zero");
+        }
+        if initial_backoff.is_zero() {
+            anyhow::bail!("Discord live edit initial backoff must be greater than zero");
+        }
+        if max_backoff < initial_backoff {
+            anyhow::bail!(
+                "Discord live edit max backoff must be greater than or equal to initial backoff"
+            );
+        }
+        Ok(Self {
+            min_interval,
+            initial_backoff,
+            max_backoff,
+        })
+    }
+
+    pub fn min_interval(&self) -> Duration {
+        self.min_interval
+    }
+
+    pub fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputMessage {
@@ -36,30 +92,39 @@ pub enum OutputMessageKind {
     Complete,
     Delta,
     Final,
+    Tool,
 }
 
 impl OutputMessage {
-    pub fn complete(namespace: impl Into<String>, body: impl Into<String>) -> Self {
+    pub fn complete(namespace: &str, body: &str) -> Self {
         Self {
-            namespace: namespace.into(),
-            body: body.into(),
+            namespace: namespace.to_string(),
+            body: body.to_string(),
             kind: OutputMessageKind::Complete,
         }
     }
 
-    pub fn delta(namespace: impl Into<String>, body: impl Into<String>) -> Self {
+    pub fn delta(namespace: &str, body: &str) -> Self {
         Self {
-            namespace: namespace.into(),
-            body: body.into(),
+            namespace: namespace.to_string(),
+            body: body.to_string(),
             kind: OutputMessageKind::Delta,
         }
     }
 
-    pub fn final_message(namespace: impl Into<String>, body: impl Into<String>) -> Self {
+    pub fn final_message(namespace: &str, body: &str) -> Self {
         Self {
-            namespace: namespace.into(),
-            body: body.into(),
+            namespace: namespace.to_string(),
+            body: body.to_string(),
             kind: OutputMessageKind::Final,
+        }
+    }
+
+    pub fn tool(namespace: &str, body: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+            body: body.to_string(),
+            kind: OutputMessageKind::Tool,
         }
     }
 }
@@ -67,6 +132,8 @@ impl OutputMessage {
 #[async_trait]
 pub trait OutputSink: Send + Sync {
     async fn send(&self, message: OutputMessage) -> anyhow::Result<()>;
+
+    async fn live_status(&self, namespace: &str) -> String;
 }
 
 #[derive(Clone, Default)]
@@ -75,13 +142,8 @@ pub struct DiscordTypingTracker {
 }
 
 impl DiscordTypingTracker {
-    pub async fn start(
-        &self,
-        namespace: impl Into<String>,
-        channel_id: ChannelId,
-        http: &Arc<Http>,
-    ) {
-        let namespace = namespace.into();
+    pub async fn start(&self, namespace: &str, channel_id: ChannelId, http: &Arc<Http>) {
+        let namespace = namespace.to_string();
         let typing = channel_id.start_typing(http);
         if let Some(previous) = self.active.lock().await.insert(namespace.clone(), typing) {
             previous.stop();
@@ -117,6 +179,10 @@ impl OutputSink for InMemoryOutputSink {
     async fn send(&self, message: OutputMessage) -> anyhow::Result<()> {
         self.messages.lock().await.push(message);
         Ok(())
+    }
+
+    async fn live_status(&self, _namespace: &str) -> String {
+        "unavailable".to_string()
     }
 }
 
@@ -164,6 +230,11 @@ impl DiscordOutputSink {
         self.typing = Some(typing);
         self
     }
+
+    pub fn with_live_edit_config(mut self, config: DiscordLiveEditConfig) -> Self {
+        self.live = Arc::new(Mutex::new(DiscordLiveMessages::new(config)));
+        self
+    }
 }
 
 #[async_trait]
@@ -187,6 +258,7 @@ impl OutputSink for DiscordOutputSink {
                         channel_id,
                         &message.namespace,
                         &message.body,
+                        LiveMessageSlot::Response,
                         self.typing.as_ref(),
                     )
                     .await?
@@ -201,8 +273,25 @@ impl OutputSink for DiscordOutputSink {
                     typing.stop(&message.namespace).await;
                 }
                 let mut live = self.live.lock().await;
-                let live_message = live.finalize(&message.namespace);
+                let tool_message = live.finalize(&live_message_key(
+                    &message.namespace,
+                    LiveMessageSlot::Tools,
+                ));
+                let live_message = live.finalize(&live_message_key(
+                    &message.namespace,
+                    LiveMessageSlot::Response,
+                ));
                 drop(live);
+                if let Some(tool_message) = tool_message {
+                    let body = live_display(
+                        LiveMessageSlot::Tools,
+                        &message.namespace,
+                        &tool_message.text,
+                        false,
+                    );
+                    finalize_live_message(self.transport.as_ref(), channel_id, tool_message, &body)
+                        .await?;
+                }
                 if let Some(live_message) = live_message {
                     finalize_live_message(
                         self.transport.as_ref(),
@@ -213,6 +302,24 @@ impl OutputSink for DiscordOutputSink {
                     .await?;
                     return Ok(());
                 }
+            }
+            OutputMessageKind::Tool => {
+                let should_schedule = {
+                    let mut live = self.live.lock().await;
+                    live.apply_delta(
+                        self.transport.as_ref(),
+                        channel_id,
+                        &message.namespace,
+                        &message.body,
+                        LiveMessageSlot::Tools,
+                        None,
+                    )
+                    .await?
+                };
+                if should_schedule {
+                    self.schedule_live_edit_drain();
+                }
+                return Ok(());
             }
             OutputMessageKind::Complete => {
                 if let Some(typing) = &self.typing {
@@ -226,6 +333,10 @@ impl OutputSink for DiscordOutputSink {
         }
 
         Ok(())
+    }
+
+    async fn live_status(&self, namespace: &str) -> String {
+        self.live.lock().await.status_line(namespace)
     }
 }
 
@@ -254,6 +365,44 @@ trait DiscordTransport: Send + Sync {
     ) -> anyhow::Result<DiscordMessageRef>;
 
     async fn edit_message(&self, message: DiscordMessageRef, content: &str) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, Error)]
+#[error("Discord rate limited; retry after {retry_after_ms}ms")]
+struct DiscordRetryAfter {
+    retry_after_ms: u64,
+}
+
+impl DiscordRetryAfter {
+    #[cfg(test)]
+    fn new(retry_after: Duration) -> Self {
+        Self {
+            retry_after_ms: retry_after.as_millis().try_into().unwrap_or(u64::MAX),
+        }
+    }
+
+    fn duration(&self) -> Duration {
+        Duration::from_millis(self.retry_after_ms)
+    }
+}
+
+fn discord_retry_after_or_default(
+    err: &anyhow::Error,
+    serenity_429_fallback: Option<Duration>,
+) -> Option<Duration> {
+    for cause in err.chain() {
+        if let Some(retry) = cause.downcast_ref::<DiscordRetryAfter>() {
+            return Some(retry.duration());
+        }
+        if let Some(SerenityError::Http(HttpError::UnsuccessfulRequest(response))) =
+            cause.downcast_ref::<SerenityError>()
+        {
+            if response.status_code == StatusCode::TOO_MANY_REQUESTS {
+                return serenity_429_fallback;
+            }
+        }
+    }
+    None
 }
 
 struct SerenityDiscordTransport {
@@ -302,7 +451,6 @@ impl DiscordTransport for SerenityDiscordTransport {
     }
 }
 
-#[derive(Default)]
 struct DiscordLiveMessages {
     messages: HashMap<String, DiscordLiveMessage>,
     pending_edits: HashMap<String, PendingLiveEdit>,
@@ -310,11 +458,18 @@ struct DiscordLiveMessages {
     next_edit_at: Option<Instant>,
     backoff: Duration,
     drain_scheduled: bool,
+    config: DiscordLiveEditConfig,
 }
 
 struct DiscordLiveMessage {
     message: DiscordMessageRef,
     text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveMessageSlot {
+    Response,
+    Tools,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,53 +479,69 @@ struct PendingLiveEdit {
 }
 
 impl DiscordLiveMessages {
+    fn new(config: DiscordLiveEditConfig) -> Self {
+        Self {
+            messages: HashMap::new(),
+            pending_edits: HashMap::new(),
+            pending_order: VecDeque::new(),
+            next_edit_at: None,
+            backoff: Duration::ZERO,
+            drain_scheduled: false,
+            config,
+        }
+    }
+
     async fn apply_delta(
         &mut self,
         transport: &dyn DiscordTransport,
         channel_id: ChannelId,
         namespace: &str,
         delta: &str,
+        slot: LiveMessageSlot,
         typing: Option<&DiscordTypingTracker>,
     ) -> anyhow::Result<bool> {
         if delta.is_empty() {
             return Ok(false);
         }
-        if !self.messages.contains_key(namespace) {
-            if let Some(typing) = typing {
+        let key = live_message_key(namespace, slot);
+        if !self.messages.contains_key(&key) {
+            if slot == LiveMessageSlot::Response
+                && let Some(typing) = typing
+            {
                 typing.stop(namespace).await;
             }
             let message = transport
-                .send_message(channel_id, &live_display(namespace, delta))
+                .send_message(channel_id, &live_display(slot, namespace, delta, true))
                 .await?;
             self.messages.insert(
-                namespace.to_string(),
+                key,
                 DiscordLiveMessage {
                     message,
                     text: delta.to_string(),
                 },
             );
-            self.next_edit_at = Some(Instant::now() + LIVE_EDIT_MIN_INTERVAL);
+            self.next_edit_at = Some(Instant::now() + self.config.min_interval);
             self.backoff = Duration::ZERO;
             return Ok(false);
         }
 
-        let entry = self
-            .messages
-            .get_mut(namespace)
-            .expect("live message exists");
+        let entry = self.messages.get_mut(&key).expect("live message exists");
+        if slot == LiveMessageSlot::Tools && !entry.text.is_empty() {
+            entry.text.push('\n');
+        }
         entry.text.push_str(delta);
-        let content = live_display(namespace, &entry.text);
+        let content = live_display(slot, namespace, &entry.text, true);
         let pending = PendingLiveEdit {
             message: entry.message,
             content,
         };
-        self.enqueue_pending(namespace, pending);
+        self.enqueue_pending(&key, pending);
         Ok(self.schedule_drain_if_needed())
     }
 
-    fn finalize(&mut self, namespace: &str) -> Option<DiscordLiveMessage> {
-        self.remove_pending(namespace);
-        self.messages.remove(namespace)
+    fn finalize(&mut self, key: &str) -> Option<DiscordLiveMessage> {
+        self.remove_pending(key);
+        self.messages.remove(key)
     }
 
     fn enqueue_pending(&mut self, namespace: &str, edit: PendingLiveEdit) {
@@ -411,14 +582,22 @@ impl DiscordLiveMessages {
 
     fn record_live_edit_success(&mut self, now: Instant) {
         self.backoff = Duration::ZERO;
-        self.next_edit_at = Some(now + LIVE_EDIT_MIN_INTERVAL);
+        self.next_edit_at = Some(now + self.config.min_interval);
     }
 
-    fn record_live_edit_failure(&mut self, namespace: String, edit: PendingLiveEdit, now: Instant) {
-        self.backoff = if self.backoff.is_zero() {
-            LIVE_EDIT_INITIAL_BACKOFF
+    fn record_live_edit_failure(
+        &mut self,
+        namespace: String,
+        edit: PendingLiveEdit,
+        now: Instant,
+        retry_after: Option<Duration>,
+    ) {
+        self.backoff = if let Some(retry_after) = retry_after {
+            retry_after
+        } else if self.backoff.is_zero() {
+            self.config.initial_backoff
         } else {
-            std::cmp::min(self.backoff.saturating_mul(2), LIVE_EDIT_MAX_BACKOFF)
+            std::cmp::min(self.backoff.saturating_mul(2), self.config.max_backoff)
         };
         self.next_edit_at = Some(now + self.backoff);
         if self
@@ -436,6 +615,36 @@ impl DiscordLiveMessages {
         if self.pending_edits.is_empty() {
             self.drain_scheduled = false;
         }
+    }
+
+    fn status_line(&self, namespace: &str) -> String {
+        let response_key = live_message_key(namespace, LiveMessageSlot::Response);
+        let tools_key = live_message_key(namespace, LiveMessageSlot::Tools);
+        let active = match (
+            self.messages.contains_key(&response_key),
+            self.messages.contains_key(&tools_key),
+        ) {
+            (true, true) => "response+tools active",
+            (true, false) => "response active",
+            (false, true) => "tools active",
+            (false, false) => "inactive",
+        };
+        let pending_edits = [response_key, tools_key]
+            .iter()
+            .filter(|key| self.pending_edits.contains_key(*key))
+            .count();
+        let backoff = if self.backoff.is_zero() {
+            "none".to_string()
+        } else {
+            format!("{}ms", self.backoff.as_millis())
+        };
+        format!("{active}, pending edits: {pending_edits}, backoff: {backoff}")
+    }
+}
+
+impl Default for DiscordLiveMessages {
+    fn default() -> Self {
+        Self::new(DiscordLiveEditConfig::default())
     }
 }
 
@@ -478,7 +687,9 @@ async fn drain_live_edits(
                     "failed to edit Discord live output; queued retry with backoff"
                 );
                 let mut live = live.lock().await;
-                live.record_live_edit_failure(namespace, edit, Instant::now());
+                let retry_after =
+                    discord_retry_after_or_default(&err, Some(live.config.initial_backoff));
+                live.record_live_edit_failure(namespace, edit, Instant::now(), retry_after);
                 if !live.pending_edits.is_empty() {
                     continue;
                 }
@@ -535,7 +746,9 @@ async fn edit_discord_message(
                 );
                 last_error = err.to_string();
                 if attempt < DISCORD_SEND_ATTEMPTS {
-                    sleep(delay).await;
+                    let sleep_for =
+                        discord_retry_after_or_default(&err, Some(delay)).unwrap_or(delay);
+                    sleep(sleep_for).await;
                     delay *= 2;
                 }
             }
@@ -567,7 +780,9 @@ async fn send_discord_chunk(
                 );
                 last_error = err.to_string();
                 if attempt < DISCORD_SEND_ATTEMPTS {
-                    sleep(delay).await;
+                    let sleep_for =
+                        discord_retry_after_or_default(&err, Some(delay)).unwrap_or(delay);
+                    sleep(sleep_for).await;
                     delay *= 2;
                 }
             }
@@ -624,15 +839,216 @@ fn first_discord_chunk(body: &str) -> String {
         .expect("split_discord_message always returns at least one chunk")
 }
 
-fn live_display(namespace: &str, body: &str) -> String {
-    first_discord_chunk(&format!("<- [{namespace}]\n{} |", body.trim_start()))
+fn live_message_key(namespace: &str, slot: LiveMessageSlot) -> String {
+    match slot {
+        LiveMessageSlot::Response => format!("{namespace}:response"),
+        LiveMessageSlot::Tools => format!("{namespace}:tools"),
+    }
+}
+
+fn live_display(slot: LiveMessageSlot, namespace: &str, body: &str, live: bool) -> String {
+    let header = match slot {
+        LiveMessageSlot::Response => format!("<- [{namespace}]"),
+        LiveMessageSlot::Tools => format!("<- [{namespace}] tools"),
+    };
+    let cursor = if live { " |" } else { "" };
+    first_discord_chunk(&format!("{header}\n{}{}", body.trim_start(), cursor))
+}
+
+fn render_tool_started(label: &str, kind: &str) -> String {
+    format!(
+        "running `{}` ({})",
+        compact_inline(label),
+        compact_inline(kind)
+    )
+}
+
+fn render_tool_completed(
+    label: &str,
+    kind: &str,
+    status: Option<&str>,
+    exit_code: Option<i64>,
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let failed = exit_code.map(|code| code != 0).unwrap_or(false)
+        || error.map(|text| !text.trim().is_empty()).unwrap_or(false)
+        || status
+            .map(|status| {
+                let normalized = status.to_ascii_lowercase();
+                normalized.contains("fail") || normalized.contains("error")
+            })
+            .unwrap_or(false);
+    let status_text = exit_code
+        .map(|code| format!("exit {code}"))
+        .or_else(|| status.map(str::to_string))
+        .unwrap_or_else(|| "done".to_string());
+    let mut line = format!(
+        "{} `{}` ({})",
+        if failed { "failed" } else { "done" },
+        compact_inline(label),
+        compact_inline(kind)
+    );
+    line.push_str(&format!(" - {status_text}"));
+    if failed {
+        if let Some(detail) = first_non_empty([error, stderr, stdout]) {
+            line.push('\n');
+            line.push_str(&compact_block(detail, 700));
+        }
+    }
+    line
+}
+
+fn render_final_message(
+    text: &str,
+    model: Option<&str>,
+    duration_ms: Option<u64>,
+    usage: Option<&TokenUsage>,
+    exit_status: Option<&str>,
+) -> String {
+    let mut footer = Vec::new();
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        footer.push(format!("model: {}", compact_inline(model)));
+    }
+    if let Some(duration_ms) = duration_ms {
+        footer.push(format!("duration: {}", format_duration_ms(duration_ms)));
+    }
+    if let Some(usage) = usage.and_then(format_usage) {
+        footer.push(usage);
+    }
+    if let Some(exit_status) = exit_status.filter(|status| !status.trim().is_empty()) {
+        footer.push(format!("status: {}", compact_inline(exit_status)));
+    }
+    if footer.is_empty() {
+        return text.to_string();
+    }
+    if text.trim().is_empty() {
+        return format!("[{}]", footer.join(" | "));
+    }
+    format!("{}\n\n[{}]", text.trim_end(), footer.join(" | "))
+}
+
+fn format_usage(usage: &TokenUsage) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(input) = usage.input_tokens {
+        parts.push(format!("in {input}"));
+    }
+    if let Some(output) = usage.output_tokens {
+        parts.push(format!("out {output}"));
+    }
+    if let Some(cached) = usage.cached_input_tokens {
+        parts.push(format!("cached {cached}"));
+    }
+    if parts.is_empty() {
+        usage.total_tokens.map(|total| format!("tokens: {total}"))
+    } else {
+        Some(format!("tokens: {}", parts.join(", ")))
+    }
+}
+
+fn format_duration_ms(duration_ms: u64) -> String {
+    if duration_ms < 1000 {
+        format!("{duration_ms}ms")
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1000.0)
+    }
+}
+
+fn first_non_empty<const N: usize>(values: [Option<&str>; N]) -> Option<&str> {
+    values
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
+}
+
+fn compact_inline(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn compact_block(value: &str, limit: usize) -> String {
+    let compact = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if compact.len() <= limit {
+        return compact;
+    }
+    let mut end = 0;
+    for (idx, _) in compact.char_indices() {
+        if idx > limit {
+            break;
+        }
+        end = idx;
+    }
+    format!("{}...", &compact[..end])
 }
 
 pub fn event_to_output_message(event: AgentEvent) -> Option<OutputMessage> {
+    if let Some(payload) = event.payload {
+        return match payload {
+            AgentEventPayload::Text { text } => match event.stream {
+                EventStreamKind::Delta => Some(OutputMessage::delta(&event.namespace, &text)),
+                EventStreamKind::Final => {
+                    Some(OutputMessage::final_message(&event.namespace, &text))
+                }
+                EventStreamKind::Stdout => Some(OutputMessage::complete(&event.namespace, &text)),
+                EventStreamKind::Stderr | EventStreamKind::Status => None,
+            },
+            AgentEventPayload::ToolStarted { label, kind, .. } => Some(OutputMessage::tool(
+                &event.namespace,
+                &render_tool_started(&label, &kind),
+            )),
+            AgentEventPayload::ToolCompleted {
+                label,
+                kind,
+                status,
+                exit_code,
+                stdout,
+                stderr,
+                error,
+                ..
+            } => Some(OutputMessage::tool(
+                &event.namespace,
+                &render_tool_completed(
+                    &label,
+                    &kind,
+                    status.as_deref(),
+                    exit_code,
+                    stdout.as_deref(),
+                    stderr.as_deref(),
+                    error.as_deref(),
+                ),
+            )),
+            AgentEventPayload::TurnCompleted {
+                final_text,
+                model,
+                duration_ms,
+                usage,
+                exit_status,
+            } => Some(OutputMessage::final_message(
+                &event.namespace,
+                &render_final_message(
+                    &final_text,
+                    model.as_deref(),
+                    duration_ms,
+                    usage.as_ref(),
+                    exit_status.as_deref(),
+                ),
+            )),
+            AgentEventPayload::Error { message } => Some(OutputMessage::complete(
+                &event.namespace,
+                &format!("Codex error: {message}"),
+            )),
+        };
+    }
+
     match event.stream {
-        EventStreamKind::Stdout => Some(OutputMessage::complete(event.namespace, event.line)),
-        EventStreamKind::Delta => Some(OutputMessage::delta(event.namespace, event.line)),
-        EventStreamKind::Final => Some(OutputMessage::final_message(event.namespace, event.line)),
+        EventStreamKind::Stdout => Some(OutputMessage::complete(&event.namespace, &event.line)),
+        EventStreamKind::Delta => Some(OutputMessage::delta(&event.namespace, &event.line)),
+        EventStreamKind::Final => Some(OutputMessage::final_message(&event.namespace, &event.line)),
         EventStreamKind::Stderr | EventStreamKind::Status => None,
     }
 }
@@ -657,6 +1073,8 @@ mod tests {
         edits: Vec<(DiscordMessageRef, String)>,
         fail_sends: usize,
         fail_edits: usize,
+        rate_limited_sends: VecDeque<Duration>,
+        rate_limited_edits: VecDeque<Duration>,
     }
 
     impl FakeDiscordTransport {
@@ -675,6 +1093,22 @@ mod tests {
         async fn fail_next_edits(&self, count: usize) {
             self.state.lock().await.fail_edits = count;
         }
+
+        async fn rate_limit_next_send(&self, retry_after: Duration) {
+            self.state
+                .lock()
+                .await
+                .rate_limited_sends
+                .push_back(retry_after);
+        }
+
+        async fn rate_limit_next_edit(&self, retry_after: Duration) {
+            self.state
+                .lock()
+                .await
+                .rate_limited_edits
+                .push_back(retry_after);
+        }
     }
 
     #[async_trait]
@@ -685,6 +1119,9 @@ mod tests {
             content: &str,
         ) -> anyhow::Result<DiscordMessageRef> {
             let mut state = self.state.lock().await;
+            if let Some(retry_after) = state.rate_limited_sends.pop_front() {
+                return Err(DiscordRetryAfter::new(retry_after).into());
+            }
             if state.fail_sends > 0 {
                 state.fail_sends -= 1;
                 anyhow::bail!("send failed");
@@ -703,6 +1140,9 @@ mod tests {
             content: &str,
         ) -> anyhow::Result<()> {
             let mut state = self.state.lock().await;
+            if let Some(retry_after) = state.rate_limited_edits.pop_front() {
+                return Err(DiscordRetryAfter::new(retry_after).into());
+            }
             if state.fail_edits > 0 {
                 state.fail_edits -= 1;
                 anyhow::bail!("edit failed");
@@ -738,6 +1178,13 @@ mod tests {
         DiscordOutputSink::with_transport(registry_with_bindings(bindings), transport)
     }
 
+    fn output_with_config(
+        transport: Arc<FakeDiscordTransport>,
+        config: DiscordLiveEditConfig,
+    ) -> DiscordOutputSink {
+        DiscordOutputSink::with_transport(registry(), transport).with_live_edit_config(config)
+    }
+
     async fn run_live_edit_tasks() {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -758,6 +1205,90 @@ mod tests {
 
         assert_eq!(sink.messages().await.len(), 1);
         assert_eq!(sink.messages().await[0].body, "hello");
+    }
+
+    #[tokio::test]
+    async fn memory_output_reports_live_status_unavailable() {
+        let sink = InMemoryOutputSink::default();
+
+        assert_eq!(sink.live_status("moni").await, "unavailable");
+    }
+
+    #[test]
+    fn output_message_constructors_accept_owned_strings() {
+        let namespace = "moni".to_string();
+        let body = "hello".to_string();
+
+        assert_eq!(
+            OutputMessage::complete(&namespace, &body).kind,
+            OutputMessageKind::Complete
+        );
+        assert_eq!(
+            OutputMessage::delta(&namespace, &body).kind,
+            OutputMessageKind::Delta
+        );
+        assert_eq!(
+            OutputMessage::final_message(&namespace, &body).kind,
+            OutputMessageKind::Final
+        );
+        assert_eq!(
+            OutputMessage::tool(&namespace, &body).kind,
+            OutputMessageKind::Tool
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discord_output_reports_live_status_for_active_slots() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let config = DiscordLiveEditConfig::new(
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let sink = DiscordOutputSink::with_transport(
+            registry_with_bindings(&[("moni", 123), ("tools", 456)]),
+            transport,
+        )
+        .with_live_edit_config(config);
+
+        assert_eq!(
+            sink.live_status("moni").await,
+            "inactive, pending edits: 0, backoff: none"
+        );
+        sink.send(OutputMessage::delta("moni", "hello"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.live_status("moni").await,
+            "response active, pending edits: 0, backoff: none"
+        );
+        sink.send(OutputMessage::tool("tools", "exec cargo test"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.live_status("tools").await,
+            "tools active, pending edits: 0, backoff: none"
+        );
+        sink.send(OutputMessage::tool("moni", "exec cargo test"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.live_status("moni").await,
+            "response+tools active, pending edits: 0, backoff: none"
+        );
+        sink.send(OutputMessage::delta("moni", " again"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.live_status("moni").await,
+            "response+tools active, pending edits: 1, backoff: none"
+        );
+        sink.live.lock().await.backoff = Duration::from_secs(2);
+        assert_eq!(
+            sink.live_status("moni").await,
+            "response+tools active, pending edits: 1, backoff: 2000ms"
+        );
     }
 
     #[tokio::test]
@@ -801,6 +1332,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serenity_429_errors_use_configured_retry_after_fallback() {
+        let proxy = DiscordHttpProxy::start();
+        let http = Arc::new(
+            HttpBuilder::new("token")
+                .proxy(proxy.base_url())
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let transport = SerenityDiscordTransport::with_http(http);
+
+        let err = transport
+            .send_message(ChannelId::new(429), "rate limited")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            discord_retry_after_or_default(&err, Some(Duration::from_secs(4))),
+            Some(Duration::from_secs(4))
+        );
+    }
+
+    #[tokio::test]
+    async fn serenity_non_429_errors_do_not_use_retry_after_fallback() {
+        let proxy = DiscordHttpProxy::start();
+        let http = Arc::new(
+            HttpBuilder::new("token")
+                .proxy(proxy.base_url())
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let transport = SerenityDiscordTransport::with_http(http);
+
+        let err = transport
+            .send_message(ChannelId::new(400), "bad request")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            discord_retry_after_or_default(&err, Some(Duration::from_secs(4))),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn discord_typing_tracker_starts_replaces_and_stops_typing() {
         let proxy = DiscordHttpProxy::start();
         let http = Arc::new(
@@ -812,8 +1387,9 @@ mod tests {
         let tracker = DiscordTypingTracker::default();
 
         tracker.start("moni", ChannelId::new(123), &http).await;
-        proxy.wait_for_path("/channels/123/typing").await;
+        assert!(tracker.active.lock().await.contains_key("moni"));
         tracker.start("moni", ChannelId::new(123), &http).await;
+        assert_eq!(tracker.active.lock().await.len(), 1);
         tracker.stop("moni").await;
 
         assert!(tracker.active.lock().await.is_empty());
@@ -849,7 +1425,7 @@ mod tests {
             "b".repeat(DISCORD_MESSAGE_LIMIT + 5)
         );
 
-        sink.send(OutputMessage::complete("moni", body.clone()))
+        sink.send(OutputMessage::complete("moni", &body))
             .await
             .unwrap();
 
@@ -874,12 +1450,13 @@ mod tests {
     async fn discord_output_edits_live_message_and_finalizes_stream() {
         let transport = Arc::new(FakeDiscordTransport::default());
         let sink = output_with_transport(transport.clone());
+        let min_interval = DiscordLiveEditConfig::default().min_interval();
 
         sink.send(OutputMessage::delta("moni", "hel"))
             .await
             .unwrap();
         sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
-        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+        advance_live_edit_clock(min_interval).await;
         sink.send(OutputMessage::final_message("moni", "hello final"))
             .await
             .unwrap();
@@ -895,9 +1472,52 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn discord_output_renders_tool_slot_separately_from_response() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+        let min_interval = DiscordLiveEditConfig::default().min_interval();
+
+        sink.send(OutputMessage::tool("moni", "running `cargo test`"))
+            .await
+            .unwrap();
+        sink.send(OutputMessage::delta("moni", "hel"))
+            .await
+            .unwrap();
+        sink.send(OutputMessage::tool("moni", "done `cargo test`"))
+            .await
+            .unwrap();
+        advance_live_edit_clock(min_interval).await;
+        sink.send(OutputMessage::final_message("moni", "hello final"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.sends().await,
+            vec![
+                (
+                    ChannelId::new(123),
+                    "<- [moni] tools\nrunning `cargo test` |".to_string()
+                ),
+                (ChannelId::new(123), "<- [moni]\nhel |".to_string())
+            ]
+        );
+        let edits = transport.edits().await;
+        assert_eq!(
+            edits[0].1,
+            "<- [moni] tools\nrunning `cargo test`\ndone `cargo test` |"
+        );
+        assert_eq!(
+            edits[1].1,
+            "<- [moni] tools\nrunning `cargo test`\ndone `cargo test`"
+        );
+        assert_eq!(edits[2].1, "hello final");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn discord_output_flushes_pending_live_edit_after_quiet_interval() {
         let transport = Arc::new(FakeDiscordTransport::default());
         let sink = output_with_transport(transport.clone());
+        let min_interval = DiscordLiveEditConfig::default().min_interval();
 
         sink.send(OutputMessage::delta("moni", "hel"))
             .await
@@ -907,7 +1527,7 @@ mod tests {
 
         assert!(transport.edits().await.is_empty());
 
-        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+        advance_live_edit_clock(min_interval).await;
 
         assert_eq!(
             transport.edits().await,
@@ -925,6 +1545,7 @@ mod tests {
     async fn discord_output_global_live_edit_pacing_drains_one_namespace_per_interval() {
         let transport = Arc::new(FakeDiscordTransport::default());
         let sink = output_with_bindings(transport.clone(), &[("moni", 123), ("ops", 456)]);
+        let min_interval = DiscordLiveEditConfig::default().min_interval();
 
         sink.send(OutputMessage::delta("moni", "he")).await.unwrap();
         sink.send(OutputMessage::delta("ops", "go")).await.unwrap();
@@ -935,14 +1556,14 @@ mod tests {
             .await
             .unwrap();
 
-        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+        advance_live_edit_clock(min_interval).await;
 
         let first_edits = transport.edits().await;
         assert_eq!(first_edits.len(), 1);
         assert_eq!(first_edits[0].0.channel_id, ChannelId::new(123));
         assert_eq!(first_edits[0].1, "<- [moni]\nhello |");
 
-        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+        advance_live_edit_clock(min_interval).await;
 
         let edits = transport.edits().await;
         assert_eq!(edits.len(), 2);
@@ -995,6 +1616,7 @@ mod tests {
     async fn discord_output_retries_live_edit_failures_with_backoff() {
         let transport = Arc::new(FakeDiscordTransport::default());
         let sink = output_with_transport(transport.clone());
+        let config = DiscordLiveEditConfig::default();
 
         sink.send(OutputMessage::delta("moni", "hel"))
             .await
@@ -1002,18 +1624,15 @@ mod tests {
         transport.fail_next_edits(2).await;
         sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
 
-        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+        advance_live_edit_clock(config.min_interval()).await;
         assert!(transport.edits().await.is_empty());
-        assert_eq!(sink.live.lock().await.backoff, LIVE_EDIT_INITIAL_BACKOFF);
+        assert_eq!(sink.live.lock().await.backoff, config.initial_backoff());
 
-        advance_live_edit_clock(LIVE_EDIT_INITIAL_BACKOFF).await;
+        advance_live_edit_clock(config.initial_backoff()).await;
         assert!(transport.edits().await.is_empty());
-        assert_eq!(
-            sink.live.lock().await.backoff,
-            LIVE_EDIT_INITIAL_BACKOFF * 2
-        );
+        assert_eq!(sink.live.lock().await.backoff, config.initial_backoff() * 2);
 
-        advance_live_edit_clock(LIVE_EDIT_INITIAL_BACKOFF * 2).await;
+        advance_live_edit_clock(config.initial_backoff() * 2).await;
         assert_eq!(
             transport.edits().await,
             vec![(
@@ -1028,9 +1647,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn discord_output_uses_retry_after_for_live_edit_failures() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_config(
+            transport.clone(),
+            DiscordLiveEditConfig::new(
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+
+        sink.send(OutputMessage::delta("moni", "hello"))
+            .await
+            .unwrap();
+        transport.rate_limit_next_edit(Duration::from_secs(7)).await;
+        sink.send(OutputMessage::delta("moni", " world"))
+            .await
+            .unwrap();
+
+        advance_live_edit_clock(Duration::from_secs(1)).await;
+        assert!(transport.edits().await.is_empty());
+        assert_eq!(sink.live.lock().await.backoff, Duration::from_secs(7));
+
+        advance_live_edit_clock(Duration::from_secs(7)).await;
+        assert_eq!(transport.edits().await.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn discord_output_final_flush_cancels_pending_live_edit() {
         let transport = Arc::new(FakeDiscordTransport::default());
         let sink = output_with_transport(transport.clone());
+        let min_interval = DiscordLiveEditConfig::default().min_interval();
 
         sink.send(OutputMessage::delta("moni", "hel"))
             .await
@@ -1051,7 +1700,7 @@ mod tests {
             )]
         );
 
-        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+        advance_live_edit_clock(min_interval).await;
 
         assert_eq!(transport.edits().await.len(), 1);
         assert!(!sink.live.lock().await.drain_scheduled);
@@ -1081,8 +1730,47 @@ mod tests {
         let live = live.lock().await;
         assert!(live.pending_edits.is_empty());
         assert!(!live.drain_scheduled);
-        assert_eq!(live.backoff, LIVE_EDIT_INITIAL_BACKOFF);
+        assert_eq!(
+            live.backoff,
+            DiscordLiveEditConfig::default().initial_backoff()
+        );
         assert!(transport.edits().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discord_output_uses_custom_live_edit_config() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let config = DiscordLiveEditConfig::new(
+            Duration::from_millis(50),
+            Duration::from_millis(80),
+            Duration::from_millis(120),
+        )
+        .unwrap();
+        let sink = output_with_config(transport.clone(), config);
+
+        sink.send(OutputMessage::delta("moni", "hel"))
+            .await
+            .unwrap();
+        transport.fail_next_edits(2).await;
+        sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
+
+        advance_live_edit_clock(config.min_interval()).await;
+        assert_eq!(sink.live.lock().await.backoff, config.initial_backoff());
+
+        advance_live_edit_clock(config.initial_backoff()).await;
+        assert_eq!(sink.live.lock().await.backoff, config.max_backoff());
+
+        advance_live_edit_clock(config.max_backoff()).await;
+        assert_eq!(
+            transport.edits().await,
+            vec![(
+                DiscordMessageRef {
+                    channel_id: ChannelId::new(123),
+                    message_id: MessageId::new(1),
+                },
+                "<- [moni]\nhello |".to_string()
+            )]
+        );
     }
 
     #[tokio::test]
@@ -1094,7 +1782,7 @@ mod tests {
         sink.send(OutputMessage::delta("moni", "pending"))
             .await
             .unwrap();
-        sink.send(OutputMessage::final_message("moni", final_body.clone()))
+        sink.send(OutputMessage::final_message("moni", &final_body))
             .await
             .unwrap();
 
@@ -1134,7 +1822,7 @@ mod tests {
             .unwrap();
         transport.fail_next_sends(DISCORD_SEND_ATTEMPTS).await;
         let err = sink
-            .send(OutputMessage::final_message("moni", final_body))
+            .send(OutputMessage::final_message("moni", &final_body))
             .await
             .unwrap_err();
 
@@ -1178,6 +1866,30 @@ mod tests {
         send_discord_chunk(&transport, ChannelId::new(123), "hello")
             .await
             .unwrap();
+
+        assert_eq!(
+            transport.sends().await,
+            vec![(ChannelId::new(123), "hello".to_string())]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_discord_chunk_uses_retry_after_before_retrying() {
+        let transport = FakeDiscordTransport::default();
+        transport.rate_limit_next_send(Duration::from_secs(3)).await;
+
+        let send = tokio::spawn(async move {
+            send_discord_chunk(&transport, ChannelId::new(123), "hello")
+                .await
+                .unwrap();
+            transport
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let transport = send.await.unwrap();
 
         assert_eq!(
             transport.sends().await,
@@ -1241,6 +1953,7 @@ mod tests {
             engine: AgentEngine::Claude,
             stream: EventStreamKind::Stdout,
             line: "hello".to_string(),
+            payload: None,
         })
         .unwrap();
 
@@ -1256,6 +1969,7 @@ mod tests {
             engine: AgentEngine::Codex,
             stream: EventStreamKind::Delta,
             line: "hel".to_string(),
+            payload: None,
         })
         .unwrap();
 
@@ -1270,11 +1984,272 @@ mod tests {
             engine: AgentEngine::Codex,
             stream: EventStreamKind::Final,
             line: "hello".to_string(),
+            payload: None,
         })
         .unwrap();
 
         assert_eq!(output.kind, OutputMessageKind::Final);
         assert_eq!(output.body, "hello");
+    }
+
+    #[test]
+    fn structured_final_event_renders_usage_model_and_duration() {
+        let output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Final,
+            line: "hello".to_string(),
+            payload: Some(AgentEventPayload::TurnCompleted {
+                final_text: "hello".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+                duration_ms: Some(2450),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(20),
+                    cached_input_tokens: Some(5),
+                    total_tokens: None,
+                }),
+                exit_status: Some("completed".to_string()),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(output.kind, OutputMessageKind::Final);
+        assert_eq!(
+            output.body,
+            "hello\n\n[model: gpt-5-codex | duration: 2.5s | tokens: in 10, out 20, cached 5 | status: completed]"
+        );
+    }
+
+    #[test]
+    fn structured_tool_events_render_compact_status_blocks() {
+        let started = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "tool-start:cargo test".to_string(),
+            payload: Some(AgentEventPayload::ToolStarted {
+                id: Some("tool-1".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string(),
+            }),
+        })
+        .unwrap();
+        let failed = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "tool-complete:cargo test".to_string(),
+            payload: Some(AgentEventPayload::ToolCompleted {
+                id: Some("tool-1".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string(),
+                status: Some("failed".to_string()),
+                exit_code: Some(101),
+                stdout: Some("lots of stdout".to_string()),
+                stderr: Some("test failed".to_string()),
+                error: None,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(started.kind, OutputMessageKind::Tool);
+        assert_eq!(started.body, "running `cargo test` (commandExecution)");
+        assert_eq!(failed.kind, OutputMessageKind::Tool);
+        assert_eq!(
+            failed.body,
+            "failed `cargo test` (commandExecution) - exit 101\ntest failed"
+        );
+    }
+
+    #[test]
+    fn structured_tool_failed_status_and_long_output_are_compacted() {
+        let output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "tool-complete:cargo test".to_string(),
+            payload: Some(AgentEventPayload::ToolCompleted {
+                id: Some("tool-1".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string(),
+                status: Some("failed".to_string()),
+                exit_code: None,
+                stdout: Some("x".repeat(800)),
+                stderr: None,
+                error: None,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(output.kind, OutputMessageKind::Tool);
+        assert!(output.body.starts_with("failed `cargo test`"));
+        assert!(output.body.ends_with("..."));
+        assert!(output.body.len() < 760);
+    }
+
+    #[test]
+    fn structured_tool_completion_covers_status_and_detail_variants() {
+        let ok_status = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "tool-complete:cargo test".to_string(),
+            payload: Some(AgentEventPayload::ToolCompleted {
+                id: Some("tool-1".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string(),
+                status: Some("completed".to_string()),
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                error: Some(" ".to_string()),
+            }),
+        })
+        .unwrap();
+        let failed_without_detail = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "tool-complete:cargo test".to_string(),
+            payload: Some(AgentEventPayload::ToolCompleted {
+                id: Some("tool-2".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string(),
+                status: None,
+                exit_code: Some(1),
+                stdout: None,
+                stderr: None,
+                error: None,
+            }),
+        })
+        .unwrap();
+        let default_done = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "tool-complete:cargo test".to_string(),
+            payload: Some(AgentEventPayload::ToolCompleted {
+                id: Some("tool-3".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string(),
+                status: None,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                error: None,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(
+            ok_status.body,
+            "done `cargo test` (commandExecution) - completed"
+        );
+        assert_eq!(
+            failed_without_detail.body,
+            "failed `cargo test` (commandExecution) - exit 1"
+        );
+        assert_eq!(
+            default_done.body,
+            "done `cargo test` (commandExecution) - done"
+        );
+    }
+
+    #[test]
+    fn structured_text_payload_maps_non_delta_streams() {
+        let final_output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Final,
+            line: "ignored".to_string(),
+            payload: Some(AgentEventPayload::Text {
+                text: "final".to_string(),
+            }),
+        })
+        .unwrap();
+        let stdout_output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Stdout,
+            line: "ignored".to_string(),
+            payload: Some(AgentEventPayload::Text {
+                text: "stdout".to_string(),
+            }),
+        })
+        .unwrap();
+        let status_output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "ignored".to_string(),
+            payload: Some(AgentEventPayload::Text {
+                text: "status".to_string(),
+            }),
+        });
+
+        assert_eq!(final_output.kind, OutputMessageKind::Final);
+        assert_eq!(final_output.body, "final");
+        assert_eq!(stdout_output.kind, OutputMessageKind::Complete);
+        assert_eq!(stdout_output.body, "stdout");
+        assert!(status_output.is_none());
+    }
+
+    #[test]
+    fn structured_final_event_handles_footer_edge_cases() {
+        let plain = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Final,
+            line: "hello".to_string(),
+            payload: Some(AgentEventPayload::TurnCompleted {
+                final_text: "hello".to_string(),
+                model: None,
+                duration_ms: None,
+                usage: None,
+                exit_status: None,
+            }),
+        })
+        .unwrap();
+        let footer_only = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Final,
+            line: String::new(),
+            payload: Some(AgentEventPayload::TurnCompleted {
+                final_text: " ".to_string(),
+                model: None,
+                duration_ms: None,
+                usage: Some(TokenUsage {
+                    input_tokens: None,
+                    output_tokens: None,
+                    cached_input_tokens: None,
+                    total_tokens: Some(42),
+                }),
+                exit_status: None,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(plain.body, "hello");
+        assert_eq!(footer_only.body, "[tokens: 42]");
+    }
+
+    #[test]
+    fn structured_error_event_is_visible_output() {
+        let output = event_to_output_message(AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: EventStreamKind::Status,
+            line: "codex-error:boom".to_string(),
+            payload: Some(AgentEventPayload::Error {
+                message: "boom".to_string(),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(output.kind, OutputMessageKind::Complete);
+        assert_eq!(output.body, "Codex error: boom");
     }
 
     #[test]
@@ -1284,6 +2259,7 @@ mod tests {
             engine: AgentEngine::Claude,
             stream: EventStreamKind::Stderr,
             line: "err".to_string(),
+            payload: None,
         });
 
         assert!(output.is_none());
@@ -1296,6 +2272,7 @@ mod tests {
             engine: AgentEngine::Claude,
             stream: EventStreamKind::Status,
             line: "started".to_string(),
+            payload: None,
         });
 
         assert!(output.is_none());
@@ -1362,7 +2339,14 @@ mod tests {
             first_discord_chunk(&"a".repeat(DISCORD_MESSAGE_LIMIT + 1)).len(),
             DISCORD_MESSAGE_LIMIT
         );
-        assert_eq!(live_display("moni", "  hello"), "<- [moni]\nhello |");
+        assert_eq!(
+            live_display(LiveMessageSlot::Response, "moni", "  hello", true),
+            "<- [moni]\nhello |"
+        );
+        assert_eq!(
+            live_display(LiveMessageSlot::Tools, "moni", "  cargo test", false),
+            "<- [moni] tools\ncargo test"
+        );
     }
 
     #[test]
@@ -1375,6 +2359,55 @@ mod tests {
         assert_eq!(live.next_edit_delay(now), Duration::from_secs(60));
         live.next_edit_at = Some(now - Duration::from_secs(1));
         assert_eq!(live.next_edit_delay(now), Duration::ZERO);
+    }
+
+    #[test]
+    fn live_edit_config_defaults_and_validation_are_explicit() {
+        let default = DiscordLiveEditConfig::default();
+        assert_eq!(default.min_interval(), Duration::from_millis(900));
+        assert_eq!(default.initial_backoff(), Duration::from_millis(1500));
+        assert_eq!(default.max_backoff(), Duration::from_secs(60));
+
+        let custom = DiscordLiveEditConfig::new(
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert_eq!(custom.min_interval(), Duration::from_millis(10));
+        assert_eq!(custom.initial_backoff(), Duration::from_millis(20));
+        assert_eq!(custom.max_backoff(), Duration::from_millis(40));
+
+        assert!(
+            DiscordLiveEditConfig::new(
+                Duration::ZERO,
+                Duration::from_millis(20),
+                Duration::from_millis(40)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("interval")
+        );
+        assert!(
+            DiscordLiveEditConfig::new(
+                Duration::from_millis(10),
+                Duration::ZERO,
+                Duration::from_millis(40)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("initial backoff")
+        );
+        assert!(
+            DiscordLiveEditConfig::new(
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+                Duration::from_millis(40)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("max backoff")
+        );
     }
 
     #[test]

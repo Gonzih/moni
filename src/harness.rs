@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Stdio, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, process::Stdio, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,77 @@ pub struct AgentEvent {
     pub engine: AgentEngine,
     pub stream: EventStreamKind,
     pub line: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<AgentEventPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum AgentEventPayload {
+    Text {
+        text: String,
+    },
+    ToolStarted {
+        id: Option<String>,
+        label: String,
+        kind: String,
+    },
+    ToolCompleted {
+        id: Option<String>,
+        label: String,
+        kind: String,
+        status: Option<String>,
+        exit_code: Option<i64>,
+        stdout: Option<String>,
+        stderr: Option<String>,
+        error: Option<String>,
+    },
+    TurnCompleted {
+        final_text: String,
+        model: Option<String>,
+        duration_ms: Option<u64>,
+        usage: Option<TokenUsage>,
+        exit_status: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl AgentEvent {
+    fn new(namespace: String, engine: AgentEngine, stream: EventStreamKind, line: String) -> Self {
+        Self {
+            namespace,
+            engine,
+            stream,
+            line,
+            payload: None,
+        }
+    }
+
+    fn with_payload(
+        namespace: String,
+        engine: AgentEngine,
+        stream: EventStreamKind,
+        line: String,
+        payload: AgentEventPayload,
+    ) -> Self {
+        Self {
+            namespace,
+            engine,
+            stream,
+            line,
+            payload: Some(payload),
+        }
+    }
 }
 
 pub type AgentEventStream = mpsc::Receiver<AgentEvent>;
@@ -89,19 +160,20 @@ pub struct ProcessAgentHarness {
 struct CodexAppServerState {
     thread_id: Option<String>,
     pending_message: String,
+    delta_item_ids: HashSet<String>,
 }
 
 impl ProcessAgentHarness {
     pub fn new(
-        namespace: impl Into<String>,
-        workspace_path: impl Into<PathBuf>,
+        namespace: &str,
+        workspace_path: &std::path::Path,
         config: EngineConfig,
     ) -> (Self, AgentEventStream) {
         let (events, rx) = mpsc::channel(256);
         (
             Self {
-                namespace: namespace.into(),
-                workspace_path: workspace_path.into(),
+                namespace: namespace.to_string(),
+                workspace_path: workspace_path.to_path_buf(),
                 config,
                 child: None,
                 stdin: None,
@@ -145,23 +217,18 @@ impl ProcessAgentHarness {
                             continue;
                         }
                         let _ = events
-                            .send(AgentEvent {
-                                namespace: namespace.clone(),
-                                engine,
-                                stream,
-                                line,
-                            })
+                            .send(AgentEvent::new(namespace.clone(), engine, stream, line))
                             .await;
                     }
                     Ok(None) => break,
                     Err(err) => {
                         let _ = events
-                            .send(AgentEvent {
-                                namespace: namespace.clone(),
+                            .send(AgentEvent::new(
+                                namespace.clone(),
                                 engine,
-                                stream: EventStreamKind::Status,
-                                line: format!("read-error:{err}"),
-                            })
+                                EventStreamKind::Status,
+                                format!("read-error:{err}"),
+                            ))
                             .await;
                         break;
                     }
@@ -299,12 +366,12 @@ impl ProcessAgentHarness {
             self.stdin.take();
             let _ = self
                 .events
-                .send(AgentEvent {
-                    namespace: self.namespace.clone(),
-                    engine: self.config.engine,
-                    stream: EventStreamKind::Status,
-                    line: format!("exited:{status}"),
-                })
+                .send(AgentEvent::new(
+                    self.namespace.clone(),
+                    self.config.engine,
+                    EventStreamKind::Status,
+                    format!("exited:{status}"),
+                ))
                 .await;
             return Ok(true);
         }
@@ -359,12 +426,12 @@ impl AgentHarness for ProcessAgentHarness {
 
         let _ = self
             .events
-            .send(AgentEvent {
-                namespace: self.namespace.clone(),
-                engine: self.config.engine,
-                stream: EventStreamKind::Status,
-                line: "started".to_string(),
-            })
+            .send(AgentEvent::new(
+                self.namespace.clone(),
+                self.config.engine,
+                EventStreamKind::Status,
+                "started".to_string(),
+            ))
             .await;
 
         Ok(())
@@ -406,12 +473,12 @@ impl AgentHarness for ProcessAgentHarness {
 
         let _ = self
             .events
-            .send(AgentEvent {
-                namespace: self.namespace.clone(),
-                engine: self.config.engine,
-                stream: EventStreamKind::Status,
-                line: format!("stopped:{reason:?}"),
-            })
+            .send(AgentEvent::new(
+                self.namespace.clone(),
+                self.config.engine,
+                EventStreamKind::Status,
+                format!("stopped:{reason:?}"),
+            ))
             .await;
 
         Ok(())
@@ -453,12 +520,16 @@ async fn handle_codex_app_server_line(
     };
 
     if let Some(error) = message.get("error") {
-        emit_agent_event(
+        let error_message = codex_error_message(error);
+        emit_structured_agent_event(
             events,
             namespace,
             engine,
             EventStreamKind::Status,
-            format!("codex-error:{error}"),
+            format!("codex-error:{error_message}"),
+            AgentEventPayload::Error {
+                message: error_message,
+            },
         )
         .await;
         return;
@@ -481,32 +552,385 @@ async fn handle_codex_app_server_line(
         }
         "agentMessageDelta" | "item/agentMessage/delta" => {
             if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
-                state.lock().await.pending_message.push_str(delta);
-                emit_agent_event(events, namespace, engine, EventStreamKind::Delta, delta).await;
+                let mut state = state.lock().await;
+                state.pending_message.push_str(delta);
+                if let Some(item_id) = message.pointer("/params/itemId").and_then(Value::as_str) {
+                    state.delta_item_ids.insert(item_id.to_string());
+                }
+                drop(state);
+                emit_structured_agent_event(
+                    events,
+                    namespace,
+                    engine,
+                    EventStreamKind::Delta,
+                    delta.to_string(),
+                    AgentEventPayload::Text {
+                        text: delta.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+        "item/started" => {
+            if let Some(item) = message.pointer("/params/item") {
+                if let Some(tool) = parse_tool_started(item) {
+                    emit_structured_agent_event(
+                        events,
+                        namespace,
+                        engine,
+                        EventStreamKind::Status,
+                        format!("tool-start:{}", tool.label),
+                        AgentEventPayload::ToolStarted {
+                            id: tool.id,
+                            label: tool.label,
+                            kind: tool.kind,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        "item/completed" => {
+            if let Some(item) = message.pointer("/params/item") {
+                let item_type = item_type(item);
+                if is_agent_message_item(&item_type) {
+                    let item_id = item_id(item);
+                    let already_streamed = if let Some(item_id) = &item_id {
+                        state.lock().await.delta_item_ids.remove(item_id)
+                    } else {
+                        false
+                    };
+                    if !already_streamed {
+                        if let Some(text) = extract_codex_item_text(item) {
+                            state.lock().await.pending_message.push_str(&text);
+                            emit_structured_agent_event(
+                                events,
+                                namespace,
+                                engine,
+                                EventStreamKind::Delta,
+                                text.clone(),
+                                AgentEventPayload::Text { text },
+                            )
+                            .await;
+                        }
+                    }
+                } else if let Some(tool) = parse_tool_completed(item) {
+                    emit_structured_agent_event(
+                        events,
+                        namespace,
+                        engine,
+                        EventStreamKind::Status,
+                        format!("tool-complete:{}", tool.label),
+                        AgentEventPayload::ToolCompleted {
+                            id: tool.id,
+                            label: tool.label,
+                            kind: tool.kind,
+                            status: tool.status,
+                            exit_code: tool.exit_code,
+                            stdout: tool.stdout,
+                            stderr: tool.stderr,
+                            error: tool.error,
+                        },
+                    )
+                    .await;
+                }
             }
         }
         "turnCompleted" | "turn/completed" => {
             let mut state = state.lock().await;
             let body = state.pending_message.trim().to_string();
             state.pending_message.clear();
+            state.delta_item_ids.clear();
             drop(state);
 
-            if !body.is_empty() {
-                emit_agent_event(events, namespace, engine, EventStreamKind::Final, body).await;
+            let turn = message.pointer("/params/turn").unwrap_or(&Value::Null);
+            let model = find_string(&message, &["/params/model", "/params/turn/model"]);
+            let duration_ms = find_u64(
+                &message,
+                &[
+                    "/params/duration_ms",
+                    "/params/durationMs",
+                    "/params/turn/duration_ms",
+                    "/params/turn/durationMs",
+                ],
+            );
+            let usage = parse_token_usage(
+                message
+                    .pointer("/params/usage")
+                    .or_else(|| message.pointer("/params/turn/usage")),
+            );
+            let exit_status = find_string(turn, &["/status", "/exit_status", "/exitStatus"]);
+
+            if !body.is_empty()
+                || model.is_some()
+                || duration_ms.is_some()
+                || usage.is_some()
+                || exit_status.is_some()
+            {
+                emit_structured_agent_event(
+                    events,
+                    namespace,
+                    engine,
+                    EventStreamKind::Final,
+                    body.clone(),
+                    AgentEventPayload::TurnCompleted {
+                        final_text: body,
+                        model,
+                        duration_ms,
+                        usage,
+                        exit_status,
+                    },
+                )
+                .await;
             }
         }
         "error" => {
-            emit_agent_event(
+            let error_message = message
+                .pointer("/params/message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| message.to_string());
+            emit_structured_agent_event(
                 events,
                 namespace,
                 engine,
                 EventStreamKind::Status,
-                format!("codex-error:{message}"),
+                format!("codex-error:{error_message}"),
+                AgentEventPayload::Error {
+                    message: error_message,
+                },
             )
             .await;
         }
         _ => {}
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedToolEvent {
+    id: Option<String>,
+    label: String,
+    kind: String,
+    status: Option<String>,
+    exit_code: Option<i64>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    error: Option<String>,
+}
+
+fn parse_tool_started(item: &Value) -> Option<ParsedToolEvent> {
+    let kind = item_type(item);
+    if !is_tool_item(&kind) {
+        return None;
+    }
+    Some(ParsedToolEvent {
+        id: item_id(item),
+        label: tool_label(item, &kind),
+        kind,
+        status: None,
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        error: None,
+    })
+}
+
+fn parse_tool_completed(item: &Value) -> Option<ParsedToolEvent> {
+    let kind = item_type(item);
+    if !is_tool_item(&kind) {
+        return None;
+    }
+    Some(ParsedToolEvent {
+        id: item_id(item),
+        label: tool_label(item, &kind),
+        kind,
+        status: find_string(item, &["/status", "/state"]),
+        exit_code: find_i64(
+            item,
+            &[
+                "/exitCode",
+                "/exit_code",
+                "/output/exitCode",
+                "/output/exit_code",
+            ],
+        ),
+        stdout: find_string(
+            item,
+            &[
+                "/stdout",
+                "/output/stdout",
+                "/formattedOutput",
+                "/formatted_output",
+            ],
+        ),
+        stderr: find_string(item, &["/stderr", "/output/stderr"]),
+        error: find_string(
+            item,
+            &[
+                "/error",
+                "/error/message",
+                "/output/error",
+                "/output/error/message",
+            ],
+        ),
+    })
+}
+
+fn item_type(item: &Value) -> String {
+    find_string(item, &["/type"]).unwrap_or_default()
+}
+
+fn item_id(item: &Value) -> Option<String> {
+    find_string(item, &["/id", "/itemId", "/item_id"])
+}
+
+fn is_agent_message_item(kind: &str) -> bool {
+    normalized_kind(kind) == "agentmessage"
+}
+
+fn is_tool_item(kind: &str) -> bool {
+    matches!(
+        normalized_kind(kind).as_str(),
+        "commandexecution" | "mcptoolcall" | "dynamictoolcall" | "tooluse"
+    )
+}
+
+fn normalized_kind(kind: &str) -> String {
+    kind.chars()
+        .filter(|ch| *ch != '_' && *ch != '-' && !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn tool_label(item: &Value, fallback: &str) -> String {
+    find_string(
+        item,
+        &[
+            "/command",
+            "/tool",
+            "/name",
+            "/call/name",
+            "/params/name",
+            "/server",
+        ],
+    )
+    .filter(|label| !label.trim().is_empty())
+    .unwrap_or_else(|| fallback.to_string())
+}
+
+fn extract_codex_item_text(item: &Value) -> Option<String> {
+    if let Some(text) = find_string(item, &["/text", "/content/text", "/message/content"]) {
+        return Some(text);
+    }
+    item.pointer("/content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks.iter().find_map(|block| {
+                let is_text = block
+                    .pointer("/type")
+                    .and_then(Value::as_str)
+                    .map(|kind| kind == "text" || kind == "output_text")
+                    .unwrap_or(false);
+                if is_text {
+                    block
+                        .pointer("/text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn parse_token_usage(value: Option<&Value>) -> Option<TokenUsage> {
+    let usage = value?;
+    let parsed = TokenUsage {
+        input_tokens: find_u64(
+            usage,
+            &[
+                "/input_tokens",
+                "/inputTokens",
+                "/prompt_tokens",
+                "/promptTokens",
+            ],
+        ),
+        output_tokens: find_u64(
+            usage,
+            &[
+                "/output_tokens",
+                "/outputTokens",
+                "/completion_tokens",
+                "/completionTokens",
+            ],
+        ),
+        cached_input_tokens: find_u64(
+            usage,
+            &[
+                "/cached_input_tokens",
+                "/cachedInputTokens",
+                "/cache_read_input_tokens",
+                "/cacheReadInputTokens",
+            ],
+        ),
+        total_tokens: find_u64(usage, &["/total_tokens", "/totalTokens"]),
+    };
+    if parsed == TokenUsage::default() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn find_string(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(|candidate| match candidate {
+                Value::String(text) => Some(text.clone()),
+                Value::Number(number) => Some(number.to_string()),
+                Value::Bool(flag) => Some(flag.to_string()),
+                _ => None,
+            })
+    })
+}
+
+fn find_u64(value: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(value_as_u64))
+}
+
+fn find_i64(value: &Value, pointers: &[&str]) -> Option<i64> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(value_as_i64))
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_i64().and_then(|n| n.try_into().ok())),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+fn codex_error_message(error: &Value) -> String {
+    error
+        .pointer("/message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
 }
 
 fn codex_thread_id(message: &Value, root: &str) -> Option<String> {
@@ -523,15 +947,29 @@ async fn emit_agent_event(
     namespace: &str,
     engine: AgentEngine,
     stream: EventStreamKind,
-    line: impl Into<String>,
+    line: String,
 ) {
     let _ = events
-        .send(AgentEvent {
-            namespace: namespace.to_string(),
+        .send(AgentEvent::new(namespace.to_string(), engine, stream, line))
+        .await;
+}
+
+async fn emit_structured_agent_event(
+    events: &mpsc::Sender<AgentEvent>,
+    namespace: &str,
+    engine: AgentEngine,
+    stream: EventStreamKind,
+    line: String,
+    payload: AgentEventPayload,
+) {
+    let _ = events
+        .send(AgentEvent::with_payload(
+            namespace.to_string(),
             engine,
             stream,
-            line: line.into(),
-        })
+            line,
+            payload,
+        ))
         .await;
 }
 
@@ -641,6 +1079,37 @@ done
         assert_eq!(status.engine, AgentEngine::Codex);
         assert!(!status.running);
         assert!(status.pid.is_none());
+    }
+
+    #[test]
+    fn agent_event_constructors_accept_owned_strings() {
+        let namespace = "moni".to_string();
+        let line = "hello".to_string();
+
+        let event = AgentEvent::new(
+            namespace.clone(),
+            AgentEngine::Codex,
+            EventStreamKind::Stdout,
+            line.clone(),
+        );
+        let structured = AgentEvent::with_payload(
+            namespace,
+            AgentEngine::Codex,
+            EventStreamKind::Delta,
+            line,
+            AgentEventPayload::Text {
+                text: "hello".to_string(),
+            },
+        );
+
+        assert_eq!(event.namespace, "moni");
+        assert_eq!(event.line, "hello");
+        assert_eq!(
+            structured.payload,
+            Some(AgentEventPayload::Text {
+                text: "hello".to_string()
+            })
+        );
     }
 
     #[test]
@@ -1222,7 +1691,7 @@ done
             "moni",
             AgentEngine::Codex,
             &events,
-            state,
+            state.clone(),
             r#"{"error":{"code":-32000,"message":"boom"}}"#.to_string(),
         )
         .await;
@@ -1231,6 +1700,19 @@ done
         assert_eq!(event.stream, EventStreamKind::Status);
         assert!(event.line.contains("codex-error"));
         assert!(event.line.contains("boom"));
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state,
+            r#"{"error":{"code":-32000}}"#.to_string(),
+        )
+        .await;
+
+        let fallback = next_event(&mut rx).await;
+        assert_eq!(fallback.stream, EventStreamKind::Status);
+        assert!(fallback.line.contains(r#""code":-32000"#));
     }
 
     #[tokio::test]
@@ -1269,7 +1751,7 @@ done
             "moni",
             AgentEngine::Codex,
             &events,
-            state,
+            state.clone(),
             r#"{"method":"error","params":{"message":"bad turn"}}"#.to_string(),
         )
         .await;
@@ -1278,6 +1760,19 @@ done
         assert_eq!(event.stream, EventStreamKind::Status);
         assert!(event.line.contains("codex-error"));
         assert!(event.line.contains("bad turn"));
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state,
+            r#"{"method":"error","params":{"code":"missing-message"}}"#.to_string(),
+        )
+        .await;
+
+        let fallback = next_event(&mut rx).await;
+        assert_eq!(fallback.stream, EventStreamKind::Status);
+        assert!(fallback.line.contains("missing-message"));
     }
 
     #[tokio::test]
@@ -1316,6 +1811,273 @@ done
         )
         .await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_line_preserves_tool_and_turn_metadata() {
+        let (events, mut rx) = mpsc::channel(8);
+        let state = Arc::new(Mutex::new(CodexAppServerState::default()));
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/started","params":{"item":{"id":"tool-1","type":"commandExecution","command":"cargo test"}}}"#.to_string(),
+        )
+        .await;
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/completed","params":{"item":{"id":"tool-1","type":"commandExecution","command":"cargo test","exitCode":101,"stderr":"failed"}}}"#.to_string(),
+        )
+        .await;
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/agentMessage/delta","params":{"delta":"done","itemId":"msg-1"}}"#
+                .to_string(),
+        )
+        .await;
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state,
+            r#"{"method":"turn/completed","params":{"model":"gpt-5-codex","durationMs":1234,"usage":{"inputTokens":10,"outputTokens":3},"turn":{"status":"completed"}}}"#.to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            next_event(&mut rx).await.payload,
+            Some(AgentEventPayload::ToolStarted {
+                id: Some("tool-1".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string()
+            })
+        );
+        assert_eq!(
+            next_event(&mut rx).await.payload,
+            Some(AgentEventPayload::ToolCompleted {
+                id: Some("tool-1".to_string()),
+                label: "cargo test".to_string(),
+                kind: "commandExecution".to_string(),
+                status: None,
+                exit_code: Some(101),
+                stdout: None,
+                stderr: Some("failed".to_string()),
+                error: None
+            })
+        );
+        assert_eq!(
+            next_event(&mut rx).await.payload,
+            Some(AgentEventPayload::Text {
+                text: "done".to_string()
+            })
+        );
+        assert_eq!(
+            next_event(&mut rx).await.payload,
+            Some(AgentEventPayload::TurnCompleted {
+                final_text: "done".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+                duration_ms: Some(1234),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(3),
+                    cached_input_tokens: None,
+                    total_tokens: None,
+                }),
+                exit_status: Some("completed".to_string())
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_app_server_line_handles_non_streamed_message_items() {
+        let (events, mut rx) = mpsc::channel(8);
+        let state = Arc::new(Mutex::new(CodexAppServerState::default()));
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/started","params":{"item":{"id":"msg-ignored","type":"agentMessage"}}}"#
+                .to_string(),
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/started","params":{}}"#.to_string(),
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","content":[{"type":"image","text":"skip"},{"type":"output_text","text":"from block"}]}}}"#
+                .to_string(),
+        )
+        .await;
+        let event = next_event(&mut rx).await;
+        assert_eq!(event.stream, EventStreamKind::Delta);
+        assert_eq!(event.line, "from block");
+        assert_eq!(
+            event.payload,
+            Some(AgentEventPayload::Text {
+                text: "from block".to_string()
+            })
+        );
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/agentMessage/delta","params":{"delta":"streamed","itemId":"msg-1"}}"#
+                .to_string(),
+        )
+        .await;
+        assert_eq!(next_event(&mut rx).await.line, "streamed");
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/completed","params":{"item":{"id":"msg-1","type":"agentMessage","text":"duplicate"}}}"#
+                .to_string(),
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/completed","params":{"item":{"id":"empty-msg","type":"agentMessage","content":[{"type":"image","text":"skip"}]}}}"#
+                .to_string(),
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state.clone(),
+            r#"{"method":"item/completed","params":{"item":{"id":"unknown-1","type":"unknownItem"}}}"#
+                .to_string(),
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+
+        handle_codex_app_server_line(
+            "moni",
+            AgentEngine::Codex,
+            &events,
+            state,
+            r#"{"method":"item/completed","params":{}}"#.to_string(),
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn codex_app_server_parsers_cover_fallback_shapes() {
+        let non_tool = serde_json::json!({
+            "id": "msg-1",
+            "type": "agentMessage"
+        });
+        assert!(parse_tool_started(&non_tool).is_none());
+        assert!(parse_tool_completed(&non_tool).is_none());
+        assert_eq!(parse_token_usage(Some(&serde_json::json!({}))), None);
+        assert_eq!(
+            extract_codex_item_text(&serde_json::json!({"content": {"text": "nested"}})),
+            Some("nested".to_string())
+        );
+        assert_eq!(
+            extract_codex_item_text(
+                &serde_json::json!({"content": [{"type": "image", "text": "skip"}]})
+            ),
+            None
+        );
+        assert_eq!(
+            extract_codex_item_text(
+                &serde_json::json!({"content": [{"type": "text", "text": "plain"}]})
+            ),
+            Some("plain".to_string())
+        );
+
+        let usage = parse_token_usage(Some(&serde_json::json!({
+            "promptTokens": "2",
+            "completionTokens": "3",
+            "cacheReadInputTokens": "1",
+            "totalTokens": "6"
+        })))
+        .unwrap();
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.output_tokens, Some(3));
+        assert_eq!(usage.cached_input_tokens, Some(1));
+        assert_eq!(usage.total_tokens, Some(6));
+
+        let scalars = serde_json::json!({
+            "number": 7,
+            "flag": true,
+            "signed": "-9"
+        });
+        assert_eq!(find_string(&scalars, &["/number"]), Some("7".to_string()));
+        assert_eq!(find_string(&scalars, &["/flag"]), Some("true".to_string()));
+        assert_eq!(find_i64(&scalars, &["/signed"]), Some(-9));
+        assert_eq!(value_as_u64(&serde_json::json!(-1)), None);
+        assert_eq!(value_as_u64(&serde_json::json!(true)), None);
+        assert_eq!(value_as_i64(&serde_json::json!(null)), None);
+
+        let started_with_blank_label = parse_tool_started(&serde_json::json!({
+            "type": "tool_use",
+            "command": " "
+        }))
+        .unwrap();
+        assert_eq!(started_with_blank_label.label, "tool_use");
+
+        let completed = parse_tool_completed(&serde_json::json!({
+            "id": "tool-2",
+            "type": "mcp_tool_call",
+            "server": "filesystem",
+            "state": "errored",
+            "output": {
+                "exit_code": "-7",
+                "stderr": true,
+                "error": {
+                    "message": "boom"
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(completed.id.as_deref(), Some("tool-2"));
+        assert_eq!(completed.label, "filesystem");
+        assert_eq!(completed.kind, "mcp_tool_call");
+        assert_eq!(completed.status.as_deref(), Some("errored"));
+        assert_eq!(completed.exit_code, Some(-7));
+        assert_eq!(completed.stderr.as_deref(), Some("true"));
+        assert_eq!(completed.error.as_deref(), Some("boom"));
+        assert_eq!(
+            codex_error_message(&serde_json::json!({"code": -32000})),
+            "{\"code\":-32000}"
+        );
     }
 
     #[tokio::test]
@@ -1375,6 +2137,9 @@ done
             engine: AgentEngine::Claude,
             stream: EventStreamKind::Stdout,
             line: "hello".to_string(),
+            payload: Some(AgentEventPayload::Text {
+                text: "hello".to_string(),
+            }),
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: AgentEvent = serde_json::from_str(&encoded).unwrap();

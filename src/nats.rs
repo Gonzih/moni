@@ -125,6 +125,7 @@ mod tests {
             cron: CronEngine::default(),
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             state_store: None,
+            voice_status: None,
         }))
     }
 

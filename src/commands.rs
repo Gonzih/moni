@@ -4,7 +4,9 @@ pub enum CommandAction {
     Reset,
     Clear,
     Compact,
+    Status,
     SetModel { model: String },
+    VoiceStatus,
     CronAdd { schedule: String, message: String },
     CronList,
     CronPause { id: String },
@@ -49,6 +51,8 @@ pub fn parse_command(
         "/reset" => CommandAction::Reset,
         "/clear" => CommandAction::Clear,
         "/compact" => CommandAction::Compact,
+        "/status" => CommandAction::Status,
+        "/voice" => parse_voice_command(parts.collect::<Vec<_>>())?,
         "/model" => CommandAction::SetModel {
             model: parts.collect::<Vec<_>>().join(" "),
         },
@@ -62,6 +66,17 @@ pub fn parse_command(
     }
 
     Ok(Some(ParsedCommand { namespace, action }))
+}
+
+fn parse_voice_command(parts: Vec<&str>) -> anyhow::Result<CommandAction> {
+    let Some(subcommand) = parts.first().copied() else {
+        anyhow::bail!("missing voice subcommand");
+    };
+
+    match subcommand {
+        "status" => Ok(CommandAction::VoiceStatus),
+        other => anyhow::bail!("unknown voice subcommand `{other}`"),
+    }
 }
 
 fn parse_cron_command(parts: Vec<&str>) -> anyhow::Result<CommandAction> {
@@ -160,6 +175,31 @@ mod tests {
             parse_command("moni", "/compact").unwrap().unwrap().action,
             CommandAction::Compact
         );
+    }
+
+    #[test]
+    fn parses_status() {
+        assert_eq!(
+            parse_command("moni", "/status").unwrap().unwrap().action,
+            CommandAction::Status
+        );
+    }
+
+    #[test]
+    fn parses_voice_status() {
+        assert_eq!(
+            parse_command("moni", "/voice status")
+                .unwrap()
+                .unwrap()
+                .action,
+            CommandAction::VoiceStatus
+        );
+    }
+
+    #[test]
+    fn voice_requires_known_subcommand() {
+        assert!(parse_command("moni", "/voice").is_err());
+        assert!(parse_command("moni", "/voice nope").is_err());
     }
 
     #[test]

@@ -186,6 +186,26 @@ fn response_for_path(path: &str) -> (&'static str, String) {
     if path.contains("/interactions/") && path.contains("/callback") {
         return ("204 No Content", String::new());
     }
+    if path.contains("/channels/429/") && path.contains("/messages") {
+        return (
+            "429 Too Many Requests",
+            json!({
+                "code": 0,
+                "message": "rate limited"
+            })
+            .to_string(),
+        );
+    }
+    if path.contains("/channels/400/") && path.contains("/messages") {
+        return (
+            "400 Bad Request",
+            json!({
+                "code": 50035,
+                "message": "invalid form body"
+            })
+            .to_string(),
+        );
+    }
     if path.contains("/messages") {
         return ("200 OK", discord_message_json().to_string());
     }

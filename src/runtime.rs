@@ -4,8 +4,9 @@ use async_trait::async_trait;
 
 use crate::discord::{DiscordGateway, SerenityDiscordGateway, run_discord_bot_with_gateway};
 use crate::{
-    AgentEngine, AgentProtocol, BindingRegistry, CronEngine, DiscordBotConfig, DiscordOutputSink,
-    DiscordTypingTracker, EngineConfig, FileStateStore, MoniApp, MoniAppConfig, NatsNamespaceQueue,
+    AgentEngine, AgentProtocol, BindingRegistry, CronEngine, DiscordBotConfig,
+    DiscordLiveEditConfig, DiscordOutputSink, DiscordTypingTracker, EngineConfig,
+    FileRunHistoryStore, FileStateStore, MoniApp, MoniAppConfig, NatsNamespaceQueue, RunHistory,
     SessionManager, StateStore, StaticEngineConfigResolver, VoiceTranscriber,
     parse_channel_bindings,
 };
@@ -31,6 +32,7 @@ struct RuntimeParts {
     typing: DiscordTypingTracker,
     nats_queue: NatsNamespaceQueue,
     cron_tick_seconds: u64,
+    live_edit_config: DiscordLiveEditConfig,
 }
 
 fn default_workspace_root() -> String {
@@ -43,6 +45,38 @@ fn workspace_root_from_home(home: Option<PathBuf>) -> String {
         None => PathBuf::from("."),
     };
     root.join("moni-workspace").to_string_lossy().to_string()
+}
+
+fn optional_duration_ms<E: EnvSource + Sync>(
+    env: &E,
+    key: &str,
+    default: Duration,
+) -> anyhow::Result<Duration> {
+    let Some(value) = env.var(key) else {
+        return Ok(default);
+    };
+    let millis = value.parse::<u64>().map_err(|err| {
+        anyhow::anyhow!("{key} must be a positive integer millisecond value: {err}")
+    })?;
+    if millis == 0 {
+        anyhow::bail!("{key} must be greater than zero");
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn live_edit_config_from_env<E: EnvSource + Sync>(
+    env: &E,
+) -> anyhow::Result<DiscordLiveEditConfig> {
+    let defaults = DiscordLiveEditConfig::default();
+    DiscordLiveEditConfig::new(
+        optional_duration_ms(env, "MONI_LIVE_EDIT_INTERVAL_MS", defaults.min_interval())?,
+        optional_duration_ms(
+            env,
+            "MONI_LIVE_EDIT_INITIAL_BACKOFF_MS",
+            defaults.initial_backoff(),
+        )?,
+        optional_duration_ms(env, "MONI_LIVE_EDIT_MAX_BACKOFF_MS", defaults.max_backoff())?,
+    )
 }
 
 #[async_trait]
@@ -72,6 +106,12 @@ where
     }
 
     async fn run(&self, parts: RuntimeParts) -> anyhow::Result<()> {
+        tracing::info!(
+            live_edit_interval_ms = parts.live_edit_config.min_interval().as_millis(),
+            live_edit_initial_backoff_ms = parts.live_edit_config.initial_backoff().as_millis(),
+            live_edit_max_backoff_ms = parts.live_edit_config.max_backoff().as_millis(),
+            "configured Discord live edit policy"
+        );
         tokio::select! {
             result = run_discord_bot_with_gateway(parts.discord_config, parts.app.clone(), parts.registry, parts.typing, &self.discord_gateway) => result,
             result = crate::nats::run_nats_prompt_consumer(parts.nats_queue.client(), parts.app.clone()) => result,
@@ -103,6 +143,7 @@ where
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .unwrap_or(30);
+    let live_edit_config = live_edit_config_from_env(env)?;
     let workspace_root = env
         .var("MONI_WORKSPACE_ROOT")
         .unwrap_or_else(default_workspace_root);
@@ -126,9 +167,22 @@ where
     if codex_app_server && agent_args.is_empty() {
         agent_args = vec!["app-server".to_string(), "--stdio".to_string()];
     }
-    let state_store = env
-        .var("MONI_STATE_PATH")
+    let state_path = env.var("MONI_STATE_PATH");
+    let state_store = state_path
+        .clone()
         .map(|path| Arc::new(FileStateStore::new(path)) as Arc<dyn StateStore>);
+    let run_history_path = env
+        .var("MONI_RUN_HISTORY_PATH")
+        .or_else(|| state_path.map(|path| format!("{path}.runs.json")))
+        .unwrap_or_else(|| {
+            PathBuf::from(&workspace_root)
+                .join("run-history.json")
+                .to_string_lossy()
+                .to_string()
+        });
+    let run_history = Arc::new(
+        RunHistory::from_store(Arc::new(FileRunHistoryStore::new(run_history_path))).await?,
+    );
 
     let mut bindings = parse_channel_bindings(&channels)?;
     let cron_tasks = if let Some(store) = &state_store {
@@ -155,22 +209,30 @@ where
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let voice_transcriber = match runner.voice_transcriber().await {
+        Ok(transcriber) => Some(transcriber),
+        Err(err) => {
+            tracing::warn!(error = %err, "voice transcription disabled");
+            None
+        }
+    };
+    let voice_status = voice_transcriber
+        .as_ref()
+        .map(VoiceTranscriber::status_report)
+        .unwrap_or_else(|| {
+            "voice transcription unavailable - whisper.cpp is not configured".to_string()
+        });
     let discord_config = DiscordBotConfig::new(token.clone(), bindings.clone())
         .expect("bindings were validated before Discord bot config construction")
         .with_allowed_user_ids(allowed_user_ids)?
         .with_default_category_id(env.var("MONI_DEFAULT_CATEGORY_ID"))?
         .with_slash_guild_ids(slash_guild_ids)?
-        .with_voice_transcriber(match runner.voice_transcriber().await {
-            Ok(transcriber) => Some(transcriber),
-            Err(err) => {
-                tracing::warn!(error = %err, "voice transcription disabled");
-                None
-            }
-        });
+        .with_voice_transcriber(voice_transcriber);
     let nats_queue = NatsNamespaceQueue::connect(&nats_url).await?;
     let typing = DiscordTypingTracker::default();
     let output = Arc::new(
         DiscordOutputSink::with_registry(token, registry.clone())
+            .with_live_edit_config(live_edit_config)
             .with_typing_tracker(typing.clone()),
     );
     let protocol = if codex_app_server {
@@ -183,11 +245,10 @@ where
             .with_args(agent_args)
             .with_protocol(protocol),
     ));
-    let sessions = Arc::new(SessionManager::new(
-        workspace_root.into(),
-        resolver,
-        output.clone(),
-    ));
+    let sessions = Arc::new(
+        SessionManager::new(workspace_root.into(), resolver, output.clone())
+            .with_run_history(run_history),
+    );
     let app = Arc::new(MoniApp::new(MoniAppConfig {
         queue: Arc::new(nats_queue.clone()),
         sessions,
@@ -195,6 +256,7 @@ where
         cron: CronEngine::new(cron_tasks),
         registry: registry.clone(),
         state_store,
+        voice_status: Some(voice_status),
     }));
 
     runner
@@ -205,6 +267,7 @@ where
             typing,
             nats_queue,
             cron_tick_seconds,
+            live_edit_config,
         })
         .await
 }
@@ -356,12 +419,27 @@ mod tests {
             .with("MONI_ALLOWED_USER_IDS", "42, 43")
             .with("MONI_DEFAULT_CATEGORY_ID", "55")
             .with("MONI_DISCORD_SLASH_GUILD_IDS", "66, 77")
+            .with("MONI_LIVE_EDIT_INTERVAL_MS", "111")
+            .with("MONI_LIVE_EDIT_INITIAL_BACKOFF_MS", "222")
+            .with("MONI_LIVE_EDIT_MAX_BACKOFF_MS", "444")
             .with("MONI_STATE_PATH", state_path.display());
         let runner = AssertingRunner {
             voice: Ok(transcriber(dir.path())),
             assert: Some(|parts| {
                 Box::pin(async move {
                     assert_eq!(parts.cron_tick_seconds, 7);
+                    assert_eq!(
+                        parts.live_edit_config.min_interval(),
+                        Duration::from_millis(111)
+                    );
+                    assert_eq!(
+                        parts.live_edit_config.initial_backoff(),
+                        Duration::from_millis(222)
+                    );
+                    assert_eq!(
+                        parts.live_edit_config.max_backoff(),
+                        Duration::from_millis(444)
+                    );
                     assert_eq!(parts.discord_config.allowed_user_ids, vec!["42", "43"]);
                     assert_eq!(
                         parts.discord_config.default_category_id,
@@ -491,6 +569,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_live_edit_interval_fails_before_runtime_start() {
+        let env = MapEnv::default()
+            .with("MONI_DISCORD_TOKEN", "token")
+            .with("MONI_CHANNELS", "1=moni=https://example.com/moni")
+            .with("MONI_LIVE_EDIT_INTERVAL_MS", "0");
+        let runner = AssertingRunner {
+            voice: Err(anyhow::anyhow!("voice should not be loaded")),
+            assert: None,
+        };
+
+        let err = run_with_env_and_runner(&env, &runner).await.unwrap_err();
+
+        assert!(err.to_string().contains("MONI_LIVE_EDIT_INTERVAL_MS"));
+    }
+
+    #[tokio::test]
+    async fn invalid_live_edit_backoff_parse_fails_before_runtime_start() {
+        let env = MapEnv::default()
+            .with("MONI_DISCORD_TOKEN", "token")
+            .with("MONI_CHANNELS", "1=moni=https://example.com/moni")
+            .with("MONI_LIVE_EDIT_INITIAL_BACKOFF_MS", "slow");
+        let runner = AssertingRunner {
+            voice: Err(anyhow::anyhow!("voice should not be loaded")),
+            assert: None,
+        };
+
+        let err = run_with_env_and_runner(&env, &runner).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("MONI_LIVE_EDIT_INITIAL_BACKOFF_MS")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_live_edit_max_backoff_fails_before_runtime_start() {
+        let env = MapEnv::default()
+            .with("MONI_DISCORD_TOKEN", "token")
+            .with("MONI_CHANNELS", "1=moni=https://example.com/moni")
+            .with("MONI_LIVE_EDIT_INITIAL_BACKOFF_MS", "500")
+            .with("MONI_LIVE_EDIT_MAX_BACKOFF_MS", "100");
+        let runner = AssertingRunner {
+            voice: Err(anyhow::anyhow!("voice should not be loaded")),
+            assert: None,
+        };
+
+        let err = run_with_env_and_runner(&env, &runner).await.unwrap_err();
+
+        assert!(err.to_string().contains("max backoff"));
+    }
+
+    #[tokio::test]
     async fn invalid_nats_url_fails_before_runtime_start() {
         let env = MapEnv::default()
             .with("MONI_DISCORD_TOKEN", "token")
@@ -537,6 +667,7 @@ mod tests {
             assert: Some(|parts| {
                 Box::pin(async move {
                     assert_eq!(parts.cron_tick_seconds, 30);
+                    assert_eq!(parts.live_edit_config, DiscordLiveEditConfig::default());
                     assert!(parts.discord_config.allowed_user_ids.is_empty());
                     assert!(parts.discord_config.default_category_id.is_none());
                     assert!(parts.discord_config.slash_guild_ids.is_empty());

@@ -22,6 +22,7 @@ pub struct MoniAppConfig {
     pub cron: CronEngine,
     pub registry: BindingRegistry,
     pub state_store: Option<Arc<dyn StateStore>>,
+    pub voice_status: Option<String>,
 }
 
 pub struct MoniApp {
@@ -31,6 +32,7 @@ pub struct MoniApp {
     cron: Mutex<CronEngine>,
     registry: BindingRegistry,
     state_store: Option<Arc<dyn StateStore>>,
+    voice_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,7 @@ impl MoniApp {
             cron: Mutex::new(config.cron),
             registry: config.registry,
             state_store: config.state_store,
+            voice_status: config.voice_status,
         }
     }
 
@@ -74,7 +77,8 @@ impl MoniApp {
         };
         self.registry.upsert(binding.clone()).await?;
         self.persist_state().await?;
-        self.ack(&binding.namespace, "registered").await?;
+        self.ack(&binding.namespace, "registered".to_string())
+            .await?;
         Ok(true)
     }
 
@@ -138,23 +142,90 @@ impl MoniApp {
                 };
                 self.registry.upsert(binding.clone()).await?;
                 self.persist_state().await?;
-                Ok(command_outcome(binding.namespace, "registered"))
+                Ok(command_outcome(
+                    &binding.namespace,
+                    "registered".to_string(),
+                ))
             }
             CommandAction::Reset => {
                 self.sessions
                     .stop_namespace(&binding.namespace, StopReason::Reset)
                     .await?;
-                Ok(command_outcome(&binding.namespace, "reset complete"))
+                Ok(command_outcome(
+                    &binding.namespace,
+                    "reset complete".to_string(),
+                ))
             }
             CommandAction::Clear => {
                 self.sessions
                     .stop_namespace(&binding.namespace, StopReason::Clear)
                     .await?;
-                Ok(command_outcome(&binding.namespace, "clear complete"))
+                Ok(command_outcome(
+                    &binding.namespace,
+                    "clear complete".to_string(),
+                ))
             }
             CommandAction::Compact => {
                 self.sessions.compact(&binding.namespace).await?;
-                Ok(command_outcome(&binding.namespace, "compact queued"))
+                Ok(command_outcome(
+                    &binding.namespace,
+                    "compact queued".to_string(),
+                ))
+            }
+            CommandAction::Status => {
+                let session = self.sessions.namespace_status(&binding.namespace).await?;
+                let cron_count = self
+                    .cron
+                    .lock()
+                    .await
+                    .tasks()
+                    .iter()
+                    .filter(|task| task.namespace == binding.namespace)
+                    .count();
+                let session_state = if session.active { "active" } else { "idle" };
+                let model = session.model.as_deref().unwrap_or("default");
+                let queue_depth = match self.queue.depth(&binding.namespace).await? {
+                    Some(depth) => depth.to_string(),
+                    None => "unavailable".to_string(),
+                };
+                let nats = if queue_depth == "unavailable" {
+                    "configured"
+                } else {
+                    "not configured"
+                };
+                let last_run = self
+                    .sessions
+                    .last_run(&binding.namespace)
+                    .await
+                    .map(|run| {
+                        let status = run.exit_status.unwrap_or_else(|| "running".to_string());
+                        let tools = run.tool_calls.len();
+                        format!("last run: {status}, tools: {tools}")
+                    })
+                    .unwrap_or_else(|| "last run: none".to_string());
+                let live_status = self.output.live_status(&binding.namespace).await;
+                let voice_status = self
+                    .voice_status
+                    .as_deref()
+                    .map(first_status_line)
+                    .unwrap_or("unavailable");
+                Ok(command_outcome(
+                    &binding.namespace,
+                    format!(
+                        "status\nnamespace: {}\nrepo: {}\nsession: {}\nengine: {}\nmodel: {}\ncrons: {}\nqueue depth: {}\nnats: {}\nlive output: {}\nvoice: {}\n{}",
+                        session.namespace,
+                        binding.repo_url,
+                        session_state,
+                        session.engine,
+                        model,
+                        cron_count,
+                        queue_depth,
+                        nats,
+                        live_status,
+                        voice_status,
+                        last_run
+                    ),
+                ))
             }
             CommandAction::SetModel { model } => {
                 self.sessions
@@ -165,6 +236,10 @@ impl MoniApp {
                     format!("model set to {model}"),
                 ))
             }
+            CommandAction::VoiceStatus => Ok(command_outcome(
+                &binding.namespace,
+                "voice status is available through Discord `/voice status`".to_string(),
+            )),
             CommandAction::CronAdd { schedule, message } => {
                 let task = CronTask::new(
                     binding.namespace.clone(),
@@ -231,9 +306,9 @@ impl MoniApp {
         self.ack(&outcome.namespace, outcome.body).await
     }
 
-    async fn ack(&self, namespace: &str, body: impl Into<String>) -> anyhow::Result<()> {
+    async fn ack(&self, namespace: &str, body: String) -> anyhow::Result<()> {
         self.output
-            .send(OutputMessage::complete(namespace, body))
+            .send(OutputMessage::complete(namespace, &body))
             .await
     }
 
@@ -251,15 +326,19 @@ impl MoniApp {
     }
 }
 
-fn command_outcome(namespace: impl Into<String>, body: impl Into<String>) -> CommandOutcome {
+fn command_outcome(namespace: &str, body: String) -> CommandOutcome {
     CommandOutcome {
-        namespace: namespace.into(),
-        body: body.into(),
+        namespace: namespace.to_string(),
+        body,
     }
 }
 
 fn bool_body(changed: bool, ok: &str, missing: &str) -> String {
     if changed { ok } else { missing }.to_string()
+}
+
+fn first_status_line(status: &str) -> &str {
+    status.lines().next().unwrap_or("unknown")
 }
 
 pub fn run_cron_loop(
@@ -316,8 +395,9 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use crate::{
-        FileStateStore,
+        FileStateStore, RunHistory,
         engine::{AgentEngine, EngineConfig},
+        harness::{AgentEvent, AgentEventPayload, EventStreamKind},
         nats::{NatsNamespaceQueue, run_nats_prompt_consumer},
         output::InMemoryOutputSink,
         queue::{InMemoryNamespaceQueue, NamespaceQueue, QueuedPrompt},
@@ -325,6 +405,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Default)]
+    struct DefaultDepthQueue {
+        prompts: tokio::sync::Mutex<Vec<QueuedPrompt>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NamespaceQueue for DefaultDepthQueue {
+        async fn enqueue(&self, prompt: QueuedPrompt) -> anyhow::Result<()> {
+            self.prompts.lock().await.push(prompt);
+            Ok(())
+        }
+
+        async fn drain_namespace(&self, namespace: &str) -> anyhow::Result<Vec<QueuedPrompt>> {
+            let mut prompts = self.prompts.lock().await;
+            let mut drained = Vec::new();
+            let mut retained = Vec::new();
+            for prompt in prompts.drain(..) {
+                if prompt.namespace == namespace {
+                    drained.push(prompt);
+                } else {
+                    retained.push(prompt);
+                }
+            }
+            *prompts = retained;
+            Ok(drained)
+        }
+    }
 
     fn binding() -> ChannelBinding {
         ChannelBinding {
@@ -378,6 +486,39 @@ done
             cron: CronEngine::default(),
             registry: BindingRegistry::new([binding()]).unwrap(),
             state_store: None,
+            voice_status: None,
+        });
+        (app, queue, output)
+    }
+
+    fn app_with_history(
+        dir: &TempDir,
+        history: Arc<RunHistory>,
+    ) -> (MoniApp, InMemoryNamespaceQueue, InMemoryOutputSink) {
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let queue = InMemoryNamespaceQueue::default();
+        let output = InMemoryOutputSink::default();
+        let resolver = Arc::new(StaticEngineConfigResolver::new(EngineConfig::new(
+            AgentEngine::Claude,
+            bin,
+        )));
+        let sessions = Arc::new(
+            SessionManager::new(
+                dir.path().join("workspaces"),
+                resolver,
+                Arc::new(output.clone()),
+            )
+            .with_run_history(history),
+        );
+        let app = MoniApp::new(MoniAppConfig {
+            queue: Arc::new(queue.clone()),
+            sessions,
+            output: Arc::new(output.clone()),
+            cron: CronEngine::default(),
+            registry: BindingRegistry::new([binding()]).unwrap(),
+            state_store: None,
+            voice_status: None,
         });
         (app, queue, output)
     }
@@ -508,6 +649,7 @@ done
             cron: CronEngine::default(),
             registry: BindingRegistry::new(Vec::new()).unwrap(),
             state_store: Some(store.clone()),
+            voice_status: None,
         });
 
         app.register_binding(ChannelBinding {
@@ -568,6 +710,205 @@ done
 
         assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
         assert_eq!(output.messages().await[0].body, "model set to prompt");
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_namespace_session_model_and_crons() {
+        let dir = TempDir::new().unwrap();
+        let (app, _, output) = app(&dir);
+
+        app.handle_discord_message(&binding(), message("/model prompt"))
+            .await
+            .unwrap();
+        app.handle_discord_message(&binding(), message("/cron add * * * * * run"))
+            .await
+            .unwrap();
+        app.handle_discord_message(&binding(), message("/status"))
+            .await
+            .unwrap();
+
+        let status = output.messages().await.last().unwrap().body.clone();
+        assert!(status.contains("namespace: moni"));
+        assert!(status.contains("repo: https://example.com/moni"));
+        assert!(status.contains("session: idle"));
+        assert!(status.contains("engine: claude"));
+        assert!(status.contains("model: prompt"));
+        assert!(status.contains("crons: 1"));
+        assert!(status.contains("queue depth: 0"));
+        assert!(status.contains("nats: not configured"));
+        assert!(status.contains("live output: unavailable"));
+        assert!(status.contains("voice: unavailable"));
+        assert!(status.contains("last run: none"));
+    }
+
+    #[test]
+    fn first_status_line_uses_first_nonempty_line_or_unknown() {
+        assert_eq!(first_status_line("voice ok\nmore"), "voice ok");
+        assert_eq!(first_status_line(""), "unknown");
+    }
+
+    #[test]
+    fn cron_status_string_reports_active_and_paused() {
+        let mut task = CronTask::new("moni", "repo", "* * * * *", "run");
+
+        assert_eq!(task.status_string(), "active");
+        task.status = crate::cron::CronTaskStatus::Paused;
+        assert_eq!(task.status_string(), "paused");
+    }
+
+    #[tokio::test]
+    async fn default_depth_queue_drains_only_requested_namespace() {
+        let queue = DefaultDepthQueue::default();
+
+        queue
+            .enqueue(QueuedPrompt::new("moni", None, "one", "test"))
+            .await
+            .unwrap();
+        queue
+            .enqueue(QueuedPrompt::new("ops", None, "two", "test"))
+            .await
+            .unwrap();
+
+        let drained = queue.drain_namespace("moni").await.unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].body, "one");
+        assert_eq!(queue.drain_namespace("ops").await.unwrap().len(), 1);
+        assert!(queue.drain_namespace("missing").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cron_count_reports_total_tasks() {
+        let dir = TempDir::new().unwrap();
+        let (app, _, _) = app(&dir);
+
+        assert_eq!(app.cron_count().await, 0);
+        app.handle_discord_message(&binding(), message("/cron add * * * * * run"))
+            .await
+            .unwrap();
+
+        assert_eq!(app.cron_count().await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_cron_loop_future_starts_until_cancelled() {
+        let dir = TempDir::new().unwrap();
+        let (app, _, _) = app(&dir);
+
+        let handle = tokio::spawn(run_cron_loop(Arc::new(app), Duration::from_secs(60)));
+        tokio::task::yield_now().await;
+        handle.abort();
+
+        assert!(handle.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_configured_voice_health() {
+        let dir = TempDir::new().unwrap();
+        let (base_app, queue, output) = app(&dir);
+        let app = MoniApp::new(MoniAppConfig {
+            queue: Arc::new(queue),
+            sessions: base_app.sessions,
+            output: Arc::new(output.clone()),
+            cron: CronEngine::default(),
+            registry: BindingRegistry::new([binding()]).unwrap(),
+            state_store: None,
+            voice_status: Some("voice transcription configured\nwhisper.cpp: ok".to_string()),
+        });
+
+        app.handle_discord_message(&binding(), message("/status"))
+            .await
+            .unwrap();
+
+        let status = output.messages().await.last().unwrap().body.clone();
+        assert!(status.contains("voice: voice transcription configured"));
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_unavailable_queue_depth_as_configured_nats() {
+        let dir = TempDir::new().unwrap();
+        let (base_app, _, output) = app(&dir);
+        let queue = Arc::new(DefaultDepthQueue::default());
+        let app = MoniApp::new(MoniAppConfig {
+            queue,
+            sessions: base_app.sessions,
+            output: Arc::new(output.clone()),
+            cron: CronEngine::default(),
+            registry: BindingRegistry::new([binding()]).unwrap(),
+            state_store: None,
+            voice_status: None,
+        });
+
+        app.handle_discord_message(&binding(), message("/status"))
+            .await
+            .unwrap();
+
+        let status = output.messages().await.last().unwrap().body.clone();
+        assert!(status.contains("queue depth: unavailable"));
+        assert!(status.contains("nats: configured"));
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_last_run_history() {
+        let dir = TempDir::new().unwrap();
+        let history = Arc::new(RunHistory::in_memory());
+        history
+            .start_run("moni", "run tests", Some("prompt".to_string()))
+            .await
+            .unwrap();
+        history
+            .record_agent_event(&AgentEvent {
+                namespace: "moni".to_string(),
+                engine: AgentEngine::Codex,
+                stream: EventStreamKind::Final,
+                line: "done".to_string(),
+                payload: Some(AgentEventPayload::TurnCompleted {
+                    final_text: "done".to_string(),
+                    model: Some("prompt".to_string()),
+                    duration_ms: Some(12),
+                    usage: None,
+                    exit_status: Some("completed".to_string()),
+                }),
+            })
+            .await
+            .unwrap();
+        let (app, _, output) = app_with_history(&dir, history);
+
+        app.handle_discord_message(&binding(), message("/status"))
+            .await
+            .unwrap();
+
+        let status = output.messages().await.last().unwrap().body.clone();
+        assert!(status.contains("last run: completed, tools: 0"));
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_running_last_run_history() {
+        let dir = TempDir::new().unwrap();
+        let history = Arc::new(RunHistory::in_memory());
+        history.start_run("moni", "run tests", None).await.unwrap();
+        let (app, _, output) = app_with_history(&dir, history);
+
+        app.handle_discord_message(&binding(), message("/status"))
+            .await
+            .unwrap();
+
+        let status = output.messages().await.last().unwrap().body.clone();
+        assert!(status.contains("last run: running, tools: 0"));
+    }
+
+    #[tokio::test]
+    async fn voice_status_command_has_app_level_fallback() {
+        let dir = TempDir::new().unwrap();
+        let (app, _, output) = app(&dir);
+
+        app.handle_discord_message(&binding(), message("/voice status"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.messages().await[0].body,
+            "voice status is available through Discord `/voice status`"
+        );
     }
 
     #[tokio::test]
@@ -729,6 +1070,7 @@ done
             cron: CronEngine::default(),
             registry: BindingRegistry::new([binding()]).unwrap(),
             state_store: Some(store.clone()),
+            voice_status: None,
         });
         app.handle_discord_message(&binding(), message("/cron add * * * * * run"))
             .await
@@ -758,6 +1100,7 @@ done
             cron: CronEngine::new(vec![task]),
             registry: BindingRegistry::new([binding()]).unwrap(),
             state_store: None,
+            voice_status: None,
         }));
         let loop_task = tokio::spawn(run_cron_loop(app, Duration::from_millis(10)));
 
@@ -786,6 +1129,7 @@ done
             cron: CronEngine::default(),
             registry: BindingRegistry::new([binding()]).unwrap(),
             state_store: None,
+            voice_status: None,
         }));
 
         run_cron_loop_until(app, Duration::from_secs(30), async {})
@@ -811,6 +1155,7 @@ done
             cron: CronEngine::new(vec![task]),
             registry: BindingRegistry::new([binding()]).unwrap(),
             state_store: None,
+            voice_status: None,
         }));
 
         run_cron_loop_until(app, Duration::from_millis(5), async {
@@ -873,6 +1218,7 @@ done
             }])
             .unwrap(),
             state_store: None,
+            voice_status: None,
         }));
         let consumer = tokio::spawn(run_nats_prompt_consumer(client, app));
 

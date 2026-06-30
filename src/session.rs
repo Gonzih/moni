@@ -9,6 +9,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use crate::{
     engine::EngineConfig,
     harness::{AgentEventStream, AgentHarness, ProcessAgentHarness, StopReason},
+    history::{RunHistory, RunRecord},
     output::{OutputSink, event_to_output_message},
     queue::QueuedPrompt,
 };
@@ -45,10 +46,19 @@ struct Session {
     forward_task: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceSessionStatus {
+    pub namespace: String,
+    pub active: bool,
+    pub engine: String,
+    pub model: Option<String>,
+}
+
 pub struct SessionManager {
     workspace_root: PathBuf,
     resolver: Arc<EngineConfigResolver>,
     output: Arc<dyn OutputSink>,
+    history: Option<Arc<RunHistory>>,
     sessions: Mutex<HashMap<String, Session>>,
     model_overrides: Mutex<HashMap<String, String>>,
 }
@@ -63,21 +73,51 @@ impl SessionManager {
             workspace_root,
             resolver,
             output,
+            history: None,
             sessions: Mutex::new(HashMap::new()),
             model_overrides: Mutex::new(HashMap::new()),
         }
     }
 
+    pub fn with_run_history(mut self, history: Arc<RunHistory>) -> Self {
+        self.history = Some(history);
+        self
+    }
+
     pub async fn handle_prompt(&self, prompt: QueuedPrompt) -> anyhow::Result<()> {
+        let config = self.config_for_namespace(&prompt.namespace).await?;
+        let run_started = if let Some(history) = &self.history {
+            Some(
+                history
+                    .start_run(&prompt.namespace, &prompt.body, config.model.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut sessions = self.sessions.lock().await;
         let session = self
-            .ensure_session_locked(&mut sessions, &prompt.namespace)
+            .ensure_session_locked(&mut sessions, &prompt.namespace, config)
             .await?;
-        session.harness.reap_if_exited().await?;
-        if !session.harness.status().running {
-            session.harness.start().await?;
+        let result = async {
+            session.harness.reap_if_exited().await?;
+            if !session.harness.status().running {
+                session.harness.start().await?;
+            }
+            session.harness.send(&prompt.body).await
         }
-        session.harness.send(&prompt.body).await?;
+        .await;
+        drop(sessions);
+        if let Err(err) = result {
+            if run_started.is_some()
+                && let Some(history) = &self.history
+            {
+                let _ = history
+                    .record_error(&prompt.namespace, err.to_string())
+                    .await;
+            }
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -127,6 +167,27 @@ impl SessionManager {
         self.sessions.lock().await.keys().cloned().collect()
     }
 
+    pub async fn namespace_status(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<NamespaceSessionStatus> {
+        let active = self.sessions.lock().await.contains_key(namespace);
+        let config = self.config_for_namespace(namespace).await?;
+        Ok(NamespaceSessionStatus {
+            namespace: namespace.to_string(),
+            active,
+            engine: config.engine.as_str().to_string(),
+            model: config.model,
+        })
+    }
+
+    pub async fn last_run(&self, namespace: &str) -> Option<RunRecord> {
+        match &self.history {
+            Some(history) => history.last_run(namespace).await,
+            None => None,
+        }
+    }
+
     fn workspace_path(&self, namespace: &str) -> PathBuf {
         self.workspace_root.join(namespace)
     }
@@ -143,14 +204,14 @@ impl SessionManager {
         &self,
         sessions: &'a mut HashMap<String, Session>,
         namespace: &str,
+        config: EngineConfig,
     ) -> anyhow::Result<&'a mut Session> {
         if !sessions.contains_key(namespace) {
             let workspace_path = self.workspace_path(namespace);
             tokio::fs::create_dir_all(&workspace_path).await?;
-            let config = self.config_for_namespace(namespace).await?;
-            let (harness, events) =
-                ProcessAgentHarness::new(namespace.to_string(), workspace_path, config);
-            let forward_task = spawn_output_forwarder(events, self.output.clone());
+            let (harness, events) = ProcessAgentHarness::new(namespace, &workspace_path, config);
+            let forward_task =
+                spawn_output_forwarder(events, self.output.clone(), self.history.clone());
             sessions.insert(
                 namespace.to_string(),
                 Session {
@@ -167,9 +228,13 @@ impl SessionManager {
 fn spawn_output_forwarder(
     mut events: AgentEventStream,
     output: Arc<dyn OutputSink>,
+    history: Option<Arc<RunHistory>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
+            if let Some(history) = &history {
+                let _ = history.record_agent_event(&event).await;
+            }
             if let Some(message) = event_to_output_message(event) {
                 let _ = output.send(message).await;
             }
@@ -193,7 +258,7 @@ mod tests {
 
     use crate::{
         engine::{AgentEngine, EngineConfig},
-        output::InMemoryOutputSink,
+        output::{InMemoryOutputSink, OutputMessage, OutputSink},
     };
 
     use super::*;
@@ -268,6 +333,19 @@ done
             bin,
         )));
         SessionManager::new(dir.path().join("workspaces"), resolver, Arc::new(output))
+    }
+
+    struct FailingOutputSink;
+
+    #[async_trait::async_trait]
+    impl OutputSink for FailingOutputSink {
+        async fn send(&self, _message: OutputMessage) -> anyhow::Result<()> {
+            anyhow::bail!("output failed")
+        }
+
+        async fn live_status(&self, _namespace: &str) -> String {
+            "unavailable".to_string()
+        }
     }
 
     #[test]
@@ -379,11 +457,44 @@ done
 
         timeout(
             Duration::from_secs(1),
-            spawn_output_forwarder(rx, Arc::new(output)),
+            spawn_output_forwarder(rx, Arc::new(output), None),
         )
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_forwarder_records_final_history_before_output_failure() {
+        let (tx, rx) = mpsc::channel(1);
+        let history = Arc::new(RunHistory::in_memory());
+        history
+            .start_run("moni", "prompt", Some("gpt-5-codex".to_string()))
+            .await
+            .unwrap();
+        let task = spawn_output_forwarder(rx, Arc::new(FailingOutputSink), Some(history.clone()));
+
+        tx.send(crate::harness::AgentEvent {
+            namespace: "moni".to_string(),
+            engine: AgentEngine::Codex,
+            stream: crate::harness::EventStreamKind::Final,
+            line: "final".to_string(),
+            payload: Some(crate::harness::AgentEventPayload::TurnCompleted {
+                final_text: "final".to_string(),
+                model: Some("gpt-5-codex".to_string()),
+                duration_ms: Some(12),
+                usage: None,
+                exit_status: Some("completed".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let run = history.last_run("moni").await.unwrap();
+        assert_eq!(run.final_result.as_deref(), Some("final"));
+        assert_eq!(run.duration_ms, Some(12));
     }
 
     #[tokio::test]
@@ -460,6 +571,48 @@ done
     }
 
     #[tokio::test]
+    async fn handle_prompt_records_history_error_after_run_start() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("mock-agent");
+        write_mock_agent(&bin);
+        let output = InMemoryOutputSink::default();
+        let history = Arc::new(RunHistory::in_memory());
+        let manager = manager(&dir, bin, output.clone()).with_run_history(history.clone());
+
+        manager
+            .handle_prompt(QueuedPrompt::new("moni", None, "first", "test"))
+            .await
+            .unwrap();
+        {
+            let mut sessions = manager.sessions.lock().await;
+            sessions
+                .get_mut("moni")
+                .expect("session is active")
+                .harness
+                .drop_stdin_for_test();
+        }
+
+        let err = manager
+            .handle_prompt(QueuedPrompt::new("moni", None, "second", "test"))
+            .await
+            .unwrap_err();
+        manager
+            .stop_namespace("moni", StopReason::Shutdown)
+            .await
+            .unwrap();
+
+        let run = history.last_run("moni").await.unwrap();
+        assert!(err.to_string().contains("stdin is unavailable"));
+        assert_eq!(run.prompt, "second");
+        assert_eq!(run.exit_status.as_deref(), Some("error"));
+        assert!(
+            run.errors
+                .iter()
+                .any(|error| error.contains("stdin is unavailable"))
+        );
+    }
+
+    #[tokio::test]
     async fn handle_prompt_reports_reap_error() {
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("mock-agent");
@@ -493,6 +646,11 @@ done
     }
 
     #[tokio::test]
+    async fn failing_output_sink_reports_unavailable_live_status() {
+        assert_eq!(FailingOutputSink.live_status("moni").await, "unavailable");
+    }
+
+    #[tokio::test]
     async fn set_model_replaces_active_session_and_applies_override() {
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("model-agent");
@@ -523,6 +681,93 @@ done
         assert!(bodies.iter().any(|body| body == "reply:before"));
         assert!(bodies.iter().any(|body| body == "args:--model prompt"));
         assert!(bodies.iter().any(|body| body == "reply:after"));
+    }
+
+    #[tokio::test]
+    async fn namespace_status_reports_active_state_and_model() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("model-agent");
+        write_arg_echo_agent(&bin);
+        let output = InMemoryOutputSink::default();
+        let manager = manager(&dir, bin, output.clone());
+
+        let idle = manager.namespace_status("moni").await.unwrap();
+        assert_eq!(
+            idle,
+            NamespaceSessionStatus {
+                namespace: "moni".to_string(),
+                active: false,
+                engine: "claude".to_string(),
+                model: None,
+            }
+        );
+
+        manager
+            .set_model("moni", "prompt".to_string())
+            .await
+            .unwrap();
+        manager
+            .handle_prompt(QueuedPrompt::new("moni", None, "after", "test"))
+            .await
+            .unwrap();
+        wait_for_messages(&output, 2).await;
+
+        let active = manager.namespace_status("moni").await.unwrap();
+        assert_eq!(active.active, true);
+        assert_eq!(active.model.as_deref(), Some("prompt"));
+    }
+
+    #[tokio::test]
+    async fn handle_prompt_records_run_history_from_structured_events() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("codex-app-server");
+        fs::write(
+            &bin,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  if [[ "$line" == *'"method":"thread/start"'* ]]; then
+    echo '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    echo '{"method":"item/started","params":{"item":{"id":"tool-1","type":"commandExecution","command":"cargo test"}}}'
+    echo '{"method":"item/completed","params":{"item":{"id":"tool-1","type":"commandExecution","command":"cargo test","exitCode":0}}}'
+    echo '{"method":"item/agentMessage/delta","params":{"delta":"done","itemId":"msg-1"}}'
+    echo '{"method":"turn/completed","params":{"model":"gpt-5-codex","durationMs":88,"usage":{"inputTokens":4,"outputTokens":2},"turn":{"status":"completed"}}}'
+  fi
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin, permissions).unwrap();
+        let output = InMemoryOutputSink::default();
+        let history = Arc::new(RunHistory::in_memory());
+        let resolver = Arc::new(StaticEngineConfigResolver::new(
+            EngineConfig::new(AgentEngine::Codex, bin)
+                .with_protocol(crate::engine::AgentProtocol::CodexAppServer)
+                .with_model("gpt-5-codex"),
+        ));
+        let manager = SessionManager::new(
+            dir.path().join("workspaces"),
+            resolver,
+            Arc::new(output.clone()),
+        )
+        .with_run_history(history.clone());
+
+        manager
+            .handle_prompt(QueuedPrompt::new("moni", None, "run tests", "test"))
+            .await
+            .unwrap();
+
+        let _ = wait_for_messages(&output, 3).await;
+        let run = history.last_run("moni").await.unwrap();
+        assert_eq!(run.prompt, "run tests");
+        assert_eq!(run.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(run.tool_calls[0].label, "cargo test");
+        assert_eq!(run.tool_calls[0].exit_code, Some(0));
+        assert_eq!(run.final_result.as_deref(), Some("done"));
+        assert_eq!(run.duration_ms, Some(88));
+        assert_eq!(manager.last_run("moni").await.unwrap().id, run.id);
     }
 
     #[tokio::test]

@@ -38,6 +38,9 @@ impl QueuedPrompt {
 pub trait NamespaceQueue: Send + Sync {
     async fn enqueue(&self, prompt: QueuedPrompt) -> anyhow::Result<()>;
     async fn drain_namespace(&self, namespace: &str) -> anyhow::Result<Vec<QueuedPrompt>>;
+    async fn depth(&self, _namespace: &str) -> anyhow::Result<Option<usize>> {
+        Ok(None)
+    }
 }
 
 pub fn subject_for_namespace_input(namespace: &str) -> String {
@@ -63,6 +66,11 @@ impl NamespaceQueue for InMemoryNamespaceQueue {
     async fn drain_namespace(&self, namespace: &str) -> anyhow::Result<Vec<QueuedPrompt>> {
         let mut inner = self.inner.lock().await;
         Ok(inner.remove(namespace).unwrap_or_default())
+    }
+
+    async fn depth(&self, namespace: &str) -> anyhow::Result<Option<usize>> {
+        let inner = self.inner.lock().await;
+        Ok(Some(inner.get(namespace).map(Vec::len).unwrap_or_default()))
     }
 }
 
@@ -115,6 +123,22 @@ mod tests {
         let drained = queue.drain_namespace("moni").await.unwrap();
         assert_eq!(drained[0].body, "first");
         assert_eq!(drained[1].body, "second");
+    }
+
+    #[tokio::test]
+    async fn in_memory_queue_reports_depth() {
+        let queue = InMemoryNamespaceQueue::default();
+        assert_eq!(queue.depth("moni").await.unwrap(), Some(0));
+        queue
+            .enqueue(QueuedPrompt::new("moni", None, "first", "test"))
+            .await
+            .unwrap();
+        queue
+            .enqueue(QueuedPrompt::new("moni", None, "second", "test"))
+            .await
+            .unwrap();
+
+        assert_eq!(queue.depth("moni").await.unwrap(), Some(2));
     }
 
     #[tokio::test]
