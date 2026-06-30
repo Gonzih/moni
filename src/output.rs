@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serenity::{
@@ -17,6 +21,8 @@ use crate::registry::BindingRegistry;
 const DISCORD_MESSAGE_LIMIT: usize = 1900;
 const DISCORD_SEND_ATTEMPTS: usize = 3;
 const LIVE_EDIT_MIN_INTERVAL: Duration = Duration::from_millis(900);
+const LIVE_EDIT_INITIAL_BACKOFF: Duration = Duration::from_millis(1500);
+const LIVE_EDIT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputMessage {
@@ -174,15 +180,20 @@ impl OutputSink for DiscordOutputSink {
 
         match message.kind {
             OutputMessageKind::Delta => {
-                let mut live = self.live.lock().await;
-                live.apply_delta(
-                    self.transport.as_ref(),
-                    channel_id,
-                    &message.namespace,
-                    &message.body,
-                    self.typing.as_ref(),
-                )
-                .await?;
+                let should_schedule = {
+                    let mut live = self.live.lock().await;
+                    live.apply_delta(
+                        self.transport.as_ref(),
+                        channel_id,
+                        &message.namespace,
+                        &message.body,
+                        self.typing.as_ref(),
+                    )
+                    .await?
+                };
+                if should_schedule {
+                    self.schedule_live_edit_drain();
+                }
                 return Ok(());
             }
             OutputMessageKind::Final => {
@@ -190,15 +201,16 @@ impl OutputSink for DiscordOutputSink {
                     typing.stop(&message.namespace).await;
                 }
                 let mut live = self.live.lock().await;
-                if live
-                    .finalize(
+                let live_message = live.finalize(&message.namespace);
+                drop(live);
+                if let Some(live_message) = live_message {
+                    finalize_live_message(
                         self.transport.as_ref(),
                         channel_id,
-                        &message.namespace,
+                        live_message,
                         &message.body,
                     )
-                    .await?
-                {
+                    .await?;
                     return Ok(());
                 }
             }
@@ -214,6 +226,16 @@ impl OutputSink for DiscordOutputSink {
         }
 
         Ok(())
+    }
+}
+
+impl DiscordOutputSink {
+    fn schedule_live_edit_drain(&self) {
+        let live = self.live.clone();
+        let transport = self.transport.clone();
+        tokio::spawn(async move {
+            drain_live_edits(live, transport).await;
+        });
     }
 }
 
@@ -283,12 +305,22 @@ impl DiscordTransport for SerenityDiscordTransport {
 #[derive(Default)]
 struct DiscordLiveMessages {
     messages: HashMap<String, DiscordLiveMessage>,
+    pending_edits: HashMap<String, PendingLiveEdit>,
+    pending_order: VecDeque<String>,
     next_edit_at: Option<Instant>,
+    backoff: Duration,
+    drain_scheduled: bool,
 }
 
 struct DiscordLiveMessage {
     message: DiscordMessageRef,
     text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingLiveEdit {
+    message: DiscordMessageRef,
+    content: String,
 }
 
 impl DiscordLiveMessages {
@@ -299,63 +331,186 @@ impl DiscordLiveMessages {
         namespace: &str,
         delta: &str,
         typing: Option<&DiscordTypingTracker>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         if delta.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if !self.messages.contains_key(namespace) {
             if let Some(typing) = typing {
                 typing.stop(namespace).await;
             }
-            let message = transport.send_message(channel_id, "...").await?;
+            let message = transport
+                .send_message(channel_id, &live_display(namespace, delta))
+                .await?;
             self.messages.insert(
                 namespace.to_string(),
                 DiscordLiveMessage {
                     message,
-                    text: String::new(),
+                    text: delta.to_string(),
                 },
             );
             self.next_edit_at = Some(Instant::now() + LIVE_EDIT_MIN_INTERVAL);
+            self.backoff = Duration::ZERO;
+            return Ok(false);
         }
 
-        let ready_to_edit = self.ready_to_edit();
         let entry = self
             .messages
             .get_mut(namespace)
             .expect("live message exists");
         entry.text.push_str(delta);
-        if !ready_to_edit {
-            return Ok(());
-        }
         let content = live_display(namespace, &entry.text);
-        edit_discord_message(transport, entry.message, &content).await?;
-        self.next_edit_at = Some(Instant::now() + LIVE_EDIT_MIN_INTERVAL);
-        Ok(())
-    }
-
-    async fn finalize(
-        &mut self,
-        transport: &dyn DiscordTransport,
-        channel_id: ChannelId,
-        namespace: &str,
-        body: &str,
-    ) -> anyhow::Result<bool> {
-        let Some(entry) = self.messages.remove(namespace) else {
-            return Ok(false);
+        let pending = PendingLiveEdit {
+            message: entry.message,
+            content,
         };
-        let chunks = split_discord_message(body);
-        edit_discord_message(transport, entry.message, &chunks[0]).await?;
-        for chunk in chunks.iter().skip(1) {
-            send_discord_chunk(transport, channel_id, chunk).await?;
-        }
-        Ok(true)
+        self.enqueue_pending(namespace, pending);
+        Ok(self.schedule_drain_if_needed())
     }
 
-    fn ready_to_edit(&self) -> bool {
-        self.next_edit_at
-            .map(|deadline| Instant::now() >= deadline)
-            .unwrap_or(true)
+    fn finalize(&mut self, namespace: &str) -> Option<DiscordLiveMessage> {
+        self.remove_pending(namespace);
+        self.messages.remove(namespace)
     }
+
+    fn enqueue_pending(&mut self, namespace: &str, edit: PendingLiveEdit) {
+        if !self.pending_edits.contains_key(namespace) {
+            self.pending_order.push_back(namespace.to_string());
+        }
+        self.pending_edits.insert(namespace.to_string(), edit);
+    }
+
+    fn remove_pending(&mut self, namespace: &str) {
+        self.pending_edits.remove(namespace);
+        self.pending_order.retain(|queued| queued != namespace);
+    }
+
+    fn schedule_drain_if_needed(&mut self) -> bool {
+        if self.pending_edits.is_empty() || self.drain_scheduled {
+            return false;
+        }
+        self.drain_scheduled = true;
+        true
+    }
+
+    fn next_edit_delay(&self, now: Instant) -> Duration {
+        self.next_edit_at
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or_default()
+    }
+
+    fn take_next_edit(&mut self) -> Option<(String, PendingLiveEdit)> {
+        while let Some(namespace) = self.pending_order.pop_front() {
+            let Some(edit) = self.pending_edits.remove(&namespace) else {
+                continue;
+            };
+            return Some((namespace, edit));
+        }
+        None
+    }
+
+    fn record_live_edit_success(&mut self, now: Instant) {
+        self.backoff = Duration::ZERO;
+        self.next_edit_at = Some(now + LIVE_EDIT_MIN_INTERVAL);
+    }
+
+    fn record_live_edit_failure(&mut self, namespace: String, edit: PendingLiveEdit, now: Instant) {
+        self.backoff = if self.backoff.is_zero() {
+            LIVE_EDIT_INITIAL_BACKOFF
+        } else {
+            std::cmp::min(self.backoff.saturating_mul(2), LIVE_EDIT_MAX_BACKOFF)
+        };
+        self.next_edit_at = Some(now + self.backoff);
+        if self
+            .messages
+            .get(&namespace)
+            .map(|live| live.message == edit.message)
+            .unwrap_or(false)
+            && !self.pending_edits.contains_key(&namespace)
+        {
+            self.enqueue_pending(&namespace, edit);
+        }
+    }
+
+    fn finish_drain_if_idle(&mut self) {
+        if self.pending_edits.is_empty() {
+            self.drain_scheduled = false;
+        }
+    }
+}
+
+async fn drain_live_edits(
+    live: Arc<Mutex<DiscordLiveMessages>>,
+    transport: Arc<dyn DiscordTransport>,
+) {
+    loop {
+        let delay = {
+            let live = live.lock().await;
+            live.next_edit_delay(Instant::now())
+        };
+        sleep(delay).await;
+
+        let Some((namespace, edit)) = ({
+            let mut live = live.lock().await;
+            let next = live.take_next_edit();
+            if next.is_none() {
+                live.finish_drain_if_idle();
+            }
+            next
+        }) else {
+            return;
+        };
+
+        match edit_discord_message_once(transport.as_ref(), edit.message, &edit.content).await {
+            Ok(()) => {
+                let mut live = live.lock().await;
+                live.record_live_edit_success(Instant::now());
+                if !live.pending_edits.is_empty() {
+                    continue;
+                }
+                live.finish_drain_if_idle();
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    namespace = %namespace,
+                    error = %err,
+                    "failed to edit Discord live output; queued retry with backoff"
+                );
+                let mut live = live.lock().await;
+                live.record_live_edit_failure(namespace, edit, Instant::now());
+                if !live.pending_edits.is_empty() {
+                    continue;
+                }
+                live.finish_drain_if_idle();
+                return;
+            }
+        }
+    }
+}
+
+async fn finalize_live_message(
+    transport: &dyn DiscordTransport,
+    channel_id: ChannelId,
+    live_message: DiscordLiveMessage,
+    body: &str,
+) -> anyhow::Result<()> {
+    let chunks = split_discord_message(body);
+    edit_discord_message(transport, live_message.message, &chunks[0]).await?;
+    for chunk in chunks.iter().skip(1) {
+        send_discord_chunk(transport, channel_id, chunk).await?;
+    }
+    Ok(())
+}
+
+async fn edit_discord_message_once(
+    transport: &dyn DiscordTransport,
+    message: DiscordMessageRef,
+    body: &str,
+) -> anyhow::Result<()> {
+    transport
+        .edit_message(message, &first_discord_chunk(body))
+        .await
 }
 
 async fn edit_discord_message(
@@ -557,17 +712,41 @@ mod tests {
         }
     }
 
-    fn registry() -> BindingRegistry {
-        BindingRegistry::new([crate::discord::ChannelBinding {
-            channel_id: "123".to_string(),
-            namespace: "moni".to_string(),
-            repo_url: "https://github.com/Gonzih/moni".to_string(),
-        }])
+    fn registry_with_bindings(bindings: &[(&str, u64)]) -> BindingRegistry {
+        BindingRegistry::new(bindings.iter().map(|(namespace, channel_id)| {
+            crate::discord::ChannelBinding {
+                channel_id: channel_id.to_string(),
+                namespace: namespace.to_string(),
+                repo_url: format!("https://github.com/Gonzih/{namespace}"),
+            }
+        }))
         .unwrap()
+    }
+
+    fn registry() -> BindingRegistry {
+        registry_with_bindings(&[("moni", 123)])
     }
 
     fn output_with_transport(transport: Arc<FakeDiscordTransport>) -> DiscordOutputSink {
         DiscordOutputSink::with_transport(registry(), transport)
+    }
+
+    fn output_with_bindings(
+        transport: Arc<FakeDiscordTransport>,
+        bindings: &[(&str, u64)],
+    ) -> DiscordOutputSink {
+        DiscordOutputSink::with_transport(registry_with_bindings(bindings), transport)
+    }
+
+    async fn run_live_edit_tasks() {
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
+
+    async fn advance_live_edit_clock(duration: Duration) {
+        run_live_edit_tasks().await;
+        tokio::time::advance(duration).await;
+        run_live_edit_tasks().await;
     }
 
     #[tokio::test]
@@ -691,7 +870,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn discord_output_edits_live_message_and_finalizes_stream() {
         let transport = Arc::new(FakeDiscordTransport::default());
         let sink = output_with_transport(transport.clone());
@@ -699,20 +878,76 @@ mod tests {
         sink.send(OutputMessage::delta("moni", "hel"))
             .await
             .unwrap();
-        sink.live.lock().await.next_edit_at = Some(Instant::now() - Duration::from_millis(1));
         sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
+        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
         sink.send(OutputMessage::final_message("moni", "hello final"))
             .await
             .unwrap();
 
         assert_eq!(
             transport.sends().await,
-            vec![(ChannelId::new(123), "...".to_string())]
+            vec![(ChannelId::new(123), "<- [moni]\nhel |".to_string())]
         );
         let edits = transport.edits().await;
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].1, "<- [moni]\nhello |");
         assert_eq!(edits[1].1, "hello final");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discord_output_flushes_pending_live_edit_after_quiet_interval() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+
+        sink.send(OutputMessage::delta("moni", "hel"))
+            .await
+            .unwrap();
+        sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
+        run_live_edit_tasks().await;
+
+        assert!(transport.edits().await.is_empty());
+
+        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+
+        assert_eq!(
+            transport.edits().await,
+            vec![(
+                DiscordMessageRef {
+                    channel_id: ChannelId::new(123),
+                    message_id: MessageId::new(1),
+                },
+                "<- [moni]\nhello |".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discord_output_global_live_edit_pacing_drains_one_namespace_per_interval() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_bindings(transport.clone(), &[("moni", 123), ("ops", 456)]);
+
+        sink.send(OutputMessage::delta("moni", "he")).await.unwrap();
+        sink.send(OutputMessage::delta("ops", "go")).await.unwrap();
+        sink.send(OutputMessage::delta("moni", "llo"))
+            .await
+            .unwrap();
+        sink.send(OutputMessage::delta("ops", " now"))
+            .await
+            .unwrap();
+
+        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+
+        let first_edits = transport.edits().await;
+        assert_eq!(first_edits.len(), 1);
+        assert_eq!(first_edits[0].0.channel_id, ChannelId::new(123));
+        assert_eq!(first_edits[0].1, "<- [moni]\nhello |");
+
+        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+
+        let edits = transport.edits().await;
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1].0.channel_id, ChannelId::new(456));
+        assert_eq!(edits[1].1, "<- [ops]\ngo now |");
     }
 
     #[tokio::test]
@@ -738,7 +973,7 @@ mod tests {
 
         assert_eq!(
             transport.sends().await,
-            vec![(ChannelId::new(123), "...".to_string())]
+            vec![(ChannelId::new(123), "<- [moni]\nhello |".to_string())]
         );
     }
 
@@ -756,22 +991,98 @@ mod tests {
         assert!(err.to_string().contains("send failed"));
     }
 
-    #[tokio::test]
-    async fn discord_output_reports_live_edit_error() {
+    #[tokio::test(start_paused = true)]
+    async fn discord_output_retries_live_edit_failures_with_backoff() {
         let transport = Arc::new(FakeDiscordTransport::default());
         let sink = output_with_transport(transport.clone());
 
         sink.send(OutputMessage::delta("moni", "hel"))
             .await
             .unwrap();
-        sink.live.lock().await.next_edit_at = Some(Instant::now() - Duration::from_millis(1));
-        transport.fail_next_edits(DISCORD_SEND_ATTEMPTS).await;
-        let err = sink
-            .send(OutputMessage::delta("moni", "lo"))
-            .await
-            .unwrap_err();
+        transport.fail_next_edits(2).await;
+        sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
 
-        assert!(err.to_string().contains("failed to edit Discord output"));
+        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+        assert!(transport.edits().await.is_empty());
+        assert_eq!(sink.live.lock().await.backoff, LIVE_EDIT_INITIAL_BACKOFF);
+
+        advance_live_edit_clock(LIVE_EDIT_INITIAL_BACKOFF).await;
+        assert!(transport.edits().await.is_empty());
+        assert_eq!(
+            sink.live.lock().await.backoff,
+            LIVE_EDIT_INITIAL_BACKOFF * 2
+        );
+
+        advance_live_edit_clock(LIVE_EDIT_INITIAL_BACKOFF * 2).await;
+        assert_eq!(
+            transport.edits().await,
+            vec![(
+                DiscordMessageRef {
+                    channel_id: ChannelId::new(123),
+                    message_id: MessageId::new(1),
+                },
+                "<- [moni]\nhello |".to_string()
+            )]
+        );
+        assert_eq!(sink.live.lock().await.backoff, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discord_output_final_flush_cancels_pending_live_edit() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        let sink = output_with_transport(transport.clone());
+
+        sink.send(OutputMessage::delta("moni", "hel"))
+            .await
+            .unwrap();
+        sink.send(OutputMessage::delta("moni", "lo")).await.unwrap();
+        sink.send(OutputMessage::final_message("moni", "hello final"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.edits().await,
+            vec![(
+                DiscordMessageRef {
+                    channel_id: ChannelId::new(123),
+                    message_id: MessageId::new(1),
+                },
+                "hello final".to_string()
+            )]
+        );
+
+        advance_live_edit_clock(LIVE_EDIT_MIN_INTERVAL).await;
+
+        assert_eq!(transport.edits().await.len(), 1);
+        assert!(!sink.live.lock().await.drain_scheduled);
+    }
+
+    #[tokio::test]
+    async fn live_edit_drain_drops_stale_failed_edit_without_retry() {
+        let transport = Arc::new(FakeDiscordTransport::default());
+        transport.fail_next_edits(1).await;
+        let message = DiscordMessageRef {
+            channel_id: ChannelId::new(123),
+            message_id: MessageId::new(1),
+        };
+        let mut state = DiscordLiveMessages::default();
+        state.enqueue_pending(
+            "moni",
+            PendingLiveEdit {
+                message,
+                content: "<- [moni]\nhello |".to_string(),
+            },
+        );
+        state.drain_scheduled = true;
+        let live = Arc::new(Mutex::new(state));
+
+        drain_live_edits(live.clone(), transport.clone()).await;
+
+        let live = live.lock().await;
+        assert!(live.pending_edits.is_empty());
+        assert!(!live.drain_scheduled);
+        assert_eq!(live.backoff, LIVE_EDIT_INITIAL_BACKOFF);
+        assert!(transport.edits().await.is_empty());
     }
 
     #[tokio::test]
@@ -1055,12 +1366,32 @@ mod tests {
     }
 
     #[test]
-    fn live_message_edit_deadline_defaults_to_ready() {
+    fn live_message_edit_delay_defaults_to_zero_and_saturates_past_deadlines() {
         let mut live = DiscordLiveMessages::default();
-        assert!(live.ready_to_edit());
-        live.next_edit_at = Some(Instant::now() + Duration::from_secs(60));
-        assert!(!live.ready_to_edit());
-        live.next_edit_at = Some(Instant::now() - Duration::from_secs(1));
-        assert!(live.ready_to_edit());
+        let now = Instant::now();
+
+        assert_eq!(live.next_edit_delay(now), Duration::ZERO);
+        live.next_edit_at = Some(now + Duration::from_secs(60));
+        assert_eq!(live.next_edit_delay(now), Duration::from_secs(60));
+        live.next_edit_at = Some(now - Duration::from_secs(1));
+        assert_eq!(live.next_edit_delay(now), Duration::ZERO);
+    }
+
+    #[test]
+    fn live_message_edit_queue_skips_stale_order_entries() {
+        let mut live = DiscordLiveMessages::default();
+        let message = DiscordMessageRef {
+            channel_id: ChannelId::new(123),
+            message_id: MessageId::new(1),
+        };
+        let pending = PendingLiveEdit {
+            message,
+            content: "<- [moni]\nhello |".to_string(),
+        };
+        live.pending_order.push_back("stale".to_string());
+        live.enqueue_pending("moni", pending.clone());
+
+        assert_eq!(live.take_next_edit(), Some(("moni".to_string(), pending)));
+        assert!(live.take_next_edit().is_none());
     }
 }
