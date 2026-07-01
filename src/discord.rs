@@ -319,6 +319,12 @@ fn moni_slash_commands() -> Vec<CreateCommand> {
         CreateCommand::new("clear").description("Clear the agent session for this channel"),
         CreateCommand::new("compact").description("Compact the agent session for this channel"),
         CreateCommand::new("status").description("Show Moni status for this channel"),
+        CreateCommand::new("goal")
+            .description("Run a Codex goal or Claude loop for this channel")
+            .add_option(required_string_option("prompt", "Goal prompt")),
+        CreateCommand::new("loop")
+            .description("Run a Codex goal or Claude loop for this channel")
+            .add_option(required_string_option("prompt", "Loop prompt")),
         CreateCommand::new("model")
             .description("Select the agent model for this channel")
             .add_option(required_string_option("model", "Model name, e.g. prompt")),
@@ -415,6 +421,11 @@ fn discord_slash_option(option: &CommandDataOption) -> Option<DiscordSlashComman
 fn slash_command_body(input: &DiscordSlashCommandInput) -> anyhow::Result<Option<String>> {
     match input.name.as_str() {
         "reset" | "clear" | "compact" | "status" => Ok(Some(format!("/{}", input.name))),
+        "goal" | "loop" => Ok(Some(format!(
+            "/{} {}",
+            input.name,
+            required_slash_string_option(&input.options, "prompt")?
+        ))),
         "model" => Ok(Some(format!(
             "/model {}",
             required_slash_string_option(&input.options, "model")?
@@ -1613,10 +1624,20 @@ printf wav > "$out"
         assert_eq!(
             names,
             vec![
-                "reset", "clear", "compact", "status", "model", "register", "channel", "voice",
-                "cron"
+                "reset", "clear", "compact", "status", "goal", "loop", "model", "register",
+                "channel", "voice", "cron"
             ]
         );
+        for command_name in ["goal", "loop"] {
+            let command = commands
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == command_name)
+                .unwrap();
+            assert_eq!(command["options"][0]["name"], "prompt");
+            assert_eq!(command["options"][0]["required"], true);
+        }
         let model = commands
             .as_array()
             .unwrap()
@@ -1690,6 +1711,26 @@ printf wav > "$out"
         assert_eq!(
             slash_command_body(&slash_input(123, "42", "status", Vec::new())).unwrap(),
             Some("/status".to_string())
+        );
+        assert_eq!(
+            slash_command_body(&slash_input(
+                123,
+                "42",
+                "goal",
+                vec![slash_string_option("prompt", "keep going")]
+            ))
+            .unwrap(),
+            Some("/goal keep going".to_string())
+        );
+        assert_eq!(
+            slash_command_body(&slash_input(
+                123,
+                "42",
+                "loop",
+                vec![slash_string_option("prompt", "keep going")]
+            ))
+            .unwrap(),
+            Some("/loop keep going".to_string())
         );
         assert_eq!(
             slash_command_body(&slash_input(123, "42", "unknown", Vec::new())).unwrap(),

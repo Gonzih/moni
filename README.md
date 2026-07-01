@@ -67,10 +67,14 @@ Useful Discord commands:
 
 - `/status`: show namespace, repo, session, model, cron count, queue depth, NATS availability, live-output health, voice health, and last run summary.
 - `/voice status`: show whisper.cpp, ffmpeg, curl, model path, and voice guardrail health.
+- `/goal <prompt>` or `/loop <prompt>`: run an explicit long-running goal/loop prompt. Codex receives `/goal <prompt>`; Claude receives `/loop <prompt>`.
 - `/model <name>`: select the model for this namespace and restart the active session.
 - `/reset`, `/clear`, `/compact`: session lifecycle controls.
 - `/cron ...`: manage namespace cron tasks.
 - `/channel repo:<url>` or `channel for https://github.com/org/repo`: create a routed channel for a repo.
+
+Plain Discord messages are forwarded as plain agent prompts. Moni does not wrap
+every message in `/goal`; goal/loop mode is opt-in through `/goal` or `/loop`.
 
 ## Deployment
 

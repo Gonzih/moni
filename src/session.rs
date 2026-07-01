@@ -7,7 +7,7 @@ use std::{
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
-    engine::EngineConfig,
+    engine::{AgentEngine, EngineConfig},
     harness::{AgentEventStream, AgentHarness, ProcessAgentHarness, StopReason},
     history::{RunHistory, RunRecord},
     output::{OutputSink, event_to_output_message},
@@ -131,6 +131,19 @@ impl SessionManager {
         .await
     }
 
+    pub async fn goal(&self, namespace: &str, prompt: &str) -> anyhow::Result<&'static str> {
+        let config = self.config_for_namespace(namespace).await?;
+        let command = agent_goal_command(config.engine);
+        self.handle_prompt(QueuedPrompt::new(
+            namespace,
+            None,
+            agent_goal_prompt(config.engine, prompt)?,
+            format!("command:{}", command.trim_start_matches('/')),
+        ))
+        .await?;
+        Ok(command.trim_start_matches('/'))
+    }
+
     pub async fn set_model(&self, namespace: &str, model: String) -> anyhow::Result<()> {
         let mut sessions = self.sessions.lock().await;
         self.model_overrides
@@ -244,6 +257,21 @@ fn spawn_output_forwarder(
 
 pub fn namespace_workspace(root: &Path, namespace: &str) -> PathBuf {
     root.join(namespace)
+}
+
+fn agent_goal_command(engine: AgentEngine) -> &'static str {
+    match engine {
+        AgentEngine::Codex => "/goal",
+        AgentEngine::Claude => "/loop",
+    }
+}
+
+fn agent_goal_prompt(engine: AgentEngine, prompt: &str) -> anyhow::Result<String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        anyhow::bail!("missing goal prompt");
+    }
+    Ok(format!("{} {}", agent_goal_command(engine), prompt))
 }
 
 #[cfg(test)]
@@ -768,6 +796,60 @@ done
         assert_eq!(run.final_result.as_deref(), Some("done"));
         assert_eq!(run.duration_ms, Some(88));
         assert_eq!(manager.last_run("moni").await.unwrap().id, run.id);
+    }
+
+    #[test]
+    fn agent_goal_prompt_maps_to_engine_command() {
+        assert_eq!(
+            agent_goal_prompt(AgentEngine::Codex, "ship it").unwrap(),
+            "/goal ship it"
+        );
+        assert_eq!(
+            agent_goal_prompt(AgentEngine::Claude, "ship it").unwrap(),
+            "/loop ship it"
+        );
+        assert!(agent_goal_prompt(AgentEngine::Codex, "   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn goal_command_reaches_codex_app_server_as_goal_turn() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("codex-app-server");
+        fs::write(
+            &bin,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  if [[ "$line" == *'"method":"thread/start"'* ]]; then
+    echo '{"id":2,"result":{"thread":{"id":"thread-1"}}}'
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    if [[ "$line" == *'/goal ship it'* ]]; then
+      echo '{"method":"item/agentMessage/delta","params":{"delta":"goal received","itemId":"msg-1"}}'
+    else
+      echo '{"method":"item/agentMessage/delta","params":{"delta":"unexpected turn","itemId":"msg-1"}}'
+    fi
+  fi
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin, permissions).unwrap();
+        let output = InMemoryOutputSink::default();
+        let resolver = Arc::new(StaticEngineConfigResolver::new(
+            EngineConfig::new(AgentEngine::Codex, bin)
+                .with_protocol(crate::engine::AgentProtocol::CodexAppServer),
+        ));
+        let manager = SessionManager::new(
+            dir.path().join("workspaces"),
+            resolver,
+            Arc::new(output.clone()),
+        );
+
+        assert_eq!(manager.goal("moni", "ship it").await.unwrap(), "goal");
+
+        let messages = wait_for_messages(&output, 1).await;
+        assert_eq!(messages[0].body, "goal received");
     }
 
     #[tokio::test]

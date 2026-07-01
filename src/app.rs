@@ -227,6 +227,13 @@ impl MoniApp {
                     ),
                 ))
             }
+            CommandAction::Goal { prompt } => {
+                let command = self.sessions.goal(&binding.namespace, &prompt).await?;
+                Ok(command_outcome(
+                    &binding.namespace,
+                    format!("{command} queued"),
+                ))
+            }
             CommandAction::SetModel { model } => {
                 self.sessions
                     .set_model(&binding.namespace, model.clone())
@@ -697,6 +704,25 @@ done
                 .iter()
                 .any(|message| message.body == "compact queued")
         );
+    }
+
+    #[tokio::test]
+    async fn goal_command_reaches_claude_as_loop_and_acks() {
+        let dir = TempDir::new().unwrap();
+        let (app, queue, output) = app(&dir);
+
+        app.handle_discord_message(&binding(), message("/goal keep going"))
+            .await
+            .unwrap();
+
+        assert!(queue.drain_namespace("moni").await.unwrap().is_empty());
+        let messages = wait_for_output(&output, 2).await;
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.body == "agent:/loop keep going")
+        );
+        assert!(messages.iter().any(|message| message.body == "loop queued"));
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ pub enum CommandAction {
     Clear,
     Compact,
     Status,
+    Goal { prompt: String },
     SetModel { model: String },
     VoiceStatus,
     CronAdd { schedule: String, message: String },
@@ -52,6 +53,9 @@ pub fn parse_command(
         "/clear" => CommandAction::Clear,
         "/compact" => CommandAction::Compact,
         "/status" => CommandAction::Status,
+        "/goal" | "/loop" => CommandAction::Goal {
+            prompt: required_remainder(parts.collect::<Vec<_>>(), "goal prompt")?,
+        },
         "/voice" => parse_voice_command(parts.collect::<Vec<_>>())?,
         "/model" => CommandAction::SetModel {
             model: parts.collect::<Vec<_>>().join(" "),
@@ -66,6 +70,14 @@ pub fn parse_command(
     }
 
     Ok(Some(ParsedCommand { namespace, action }))
+}
+
+fn required_remainder(parts: Vec<&str>, name: &str) -> anyhow::Result<String> {
+    let value = parts.join(" ");
+    if value.trim().is_empty() {
+        anyhow::bail!("missing {name}");
+    }
+    Ok(value)
 }
 
 fn parse_voice_command(parts: Vec<&str>) -> anyhow::Result<CommandAction> {
@@ -183,6 +195,34 @@ mod tests {
             parse_command("moni", "/status").unwrap().unwrap().action,
             CommandAction::Status
         );
+    }
+
+    #[test]
+    fn parses_goal_and_loop() {
+        assert_eq!(
+            parse_command("moni", "/goal keep working")
+                .unwrap()
+                .unwrap()
+                .action,
+            CommandAction::Goal {
+                prompt: "keep working".to_string()
+            }
+        );
+        assert_eq!(
+            parse_command("moni", "/loop keep working")
+                .unwrap()
+                .unwrap()
+                .action,
+            CommandAction::Goal {
+                prompt: "keep working".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn goal_requires_prompt() {
+        assert!(parse_command("moni", "/goal").is_err());
+        assert!(parse_command("moni", "/loop   ").is_err());
     }
 
     #[test]
